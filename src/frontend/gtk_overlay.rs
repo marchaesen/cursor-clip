@@ -265,7 +265,7 @@ fn create_layer_shell_window(
         window.connect_map(move |mapped_window| {
             let mapped_window = mapped_window.clone();
             gtk4::glib::idle_add_local_once(move || {
-                let margin = 5.0;
+                let margin = 2.0;
                 let window_width = mapped_window.allocated_width().max(overlay_width) as f64;
                 let window_height = mapped_window.allocated_height().max(overlay_height) as f64;
 
@@ -389,17 +389,17 @@ fn generate_overlay_content(
     menu_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     menu_revealer.set_halign(Align::End);
     menu_revealer.set_valign(Align::Start);
-    menu_revealer.set_margin_top(46);
-    menu_revealer.set_margin_end(10);
+    menu_revealer.set_margin_top(26);
+    menu_revealer.set_margin_end(5);
     menu_revealer.add_css_class("menu-revealer");
 
-    let menu_box = Box::new(Orientation::Vertical, 8);
-    menu_box.set_margin_top(8);
-    menu_box.set_margin_bottom(8);
-    menu_box.set_margin_start(10);
-    menu_box.set_margin_end(10);
+    let menu_box = Box::new(Orientation::Vertical, 4);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(5);
+    menu_box.set_margin_end(5);
 
-    let toggle_row = Box::new(Orientation::Horizontal, 8);
+    let toggle_row = Box::new(Orientation::Horizontal, 4);
     let toggle_label = Label::new(Some("Show delete button"));
     toggle_label.set_halign(Align::Start);
     toggle_label.set_hexpand(true);
@@ -409,7 +409,7 @@ fn generate_overlay_content(
     toggle_row.append(&toggle_check);
     menu_box.append(&toggle_row);
 
-    let pin_toggle_row = Box::new(Orientation::Horizontal, 8);
+    let pin_toggle_row = Box::new(Orientation::Horizontal, 4);
     let pin_toggle_label = Label::new(Some("Show pin icon"));
     pin_toggle_label.set_halign(Align::Start);
     pin_toggle_label.set_hexpand(true);
@@ -419,7 +419,7 @@ fn generate_overlay_content(
     pin_toggle_row.append(&pin_toggle_check);
     menu_box.append(&pin_toggle_row);
 
-    let persistence_toggle_row = Box::new(Orientation::Horizontal, 8);
+    let persistence_toggle_row = Box::new(Orientation::Horizontal, 4);
     let persistence_toggle_label = Label::new(Some("Persistent history"));
     persistence_toggle_label.set_halign(Align::Start);
     persistence_toggle_label.set_hexpand(true);
@@ -429,7 +429,7 @@ fn generate_overlay_content(
     persistence_toggle_row.append(&persistence_toggle_check);
     menu_box.append(&persistence_toggle_row);
 
-    let instant_paste_toggle_row = Box::new(Orientation::Horizontal, 8);
+    let instant_paste_toggle_row = Box::new(Orientation::Horizontal, 4);
     let instant_paste_toggle_label = Label::new(Some("Instant paste"));
     instant_paste_toggle_label.set_halign(Align::Start);
     instant_paste_toggle_label.set_hexpand(true);
@@ -492,10 +492,10 @@ fn generate_overlay_content(
     let list_box = gtk4::ListBox::new();
     // Use custom styling instead of the default boxed-list to create floating cards
     list_box.add_css_class("clipboard-list");
-    //list_box.set_margin_top(6);
-    list_box.set_margin_bottom(6);
-    list_box.set_margin_start(4);
-    list_box.set_margin_end(4);
+    //list_box.set_margin_top(3);
+    list_box.set_margin_bottom(3);
+    list_box.set_margin_start(2);
+    list_box.set_margin_end(2);
     list_box.set_selection_mode(gtk4::SelectionMode::Single);
 
     // Start with prefetched items; if empty try one lazy fetch (non-fatal if it fails)
@@ -894,7 +894,7 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
     css_provider.load_from_data(if is_dark {
         "
         window {
-            border-radius: 12px;
+            border-radius: 6px;
             background: #222226;
             background: @window_bg_color;
             color: @window_fg_color;
@@ -916,9 +916,9 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             background: #343437;
             background: @card_bg_color;
             border: 2px solid transparent;
-            border-radius: 10px;
-            padding: 4px 4px;
-            margin: 6px 12px;
+            border-radius: 5px;
+            padding: 2px 2px;
+            margin: 3px 6px;
             transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
         }
 
@@ -1038,8 +1038,8 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             background: @popover_bg_color;
             border: 1px solid alpha(#ffffff, 0.10);
             border: 1px solid alpha(@popover_fg_color, 0.10);
-            border-radius: 8px;
-            padding: 6px 8px;
+            border-radius: 4px;
+            padding: 3px 4px;
             color: @popover_fg_color;
         }
         "
@@ -1210,14 +1210,14 @@ fn generate_listboxrow_from_preview(
     let row = gtk4::ListBoxRow::new();
     row.add_css_class("clipboard-item");
 
-    let main_box = Box::new(Orientation::Vertical, 6);
-    main_box.set_margin_top(8);
-    main_box.set_margin_bottom(8);
-    main_box.set_margin_start(12);
-    main_box.set_margin_end(12);
+    let main_box = Box::new(Orientation::Vertical, 3);
+    main_box.set_margin_top(4);
+    main_box.set_margin_bottom(4);
+    main_box.set_margin_start(6);
+    main_box.set_margin_end(6);
 
     // Header with content type and time
-    let header_box = Box::new(Orientation::Horizontal, 8);
+    let header_box = Box::new(Orientation::Horizontal, 4);
 
     let type_label = Label::new(Some(item.content_type.icon()));
     type_label.add_css_class("caption");
@@ -1286,7 +1286,7 @@ fn generate_listboxrow_from_preview(
         content_label.set_halign(Align::Start);
         content_label.set_wrap(true);
         content_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        content_label.set_max_width_chars(50);
+        content_label.set_max_width_chars(100);
         content_label.set_lines(3);
         content_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         main_box.append(&content_label);
@@ -1498,8 +1498,8 @@ fn make_placeholder_row_with_message(message: &str) -> gtk4::ListBoxRow {
     let placeholder_row = gtk4::ListBoxRow::new();
     let placeholder_label = Label::new(Some(message));
     placeholder_label.add_css_class("dim-label");
-    placeholder_label.set_margin_top(20);
-    placeholder_label.set_margin_bottom(20);
+    placeholder_label.set_margin_top(10);
+    placeholder_label.set_margin_bottom(10);
     placeholder_row.set_child(Some(&placeholder_label));
     placeholder_row.set_selectable(false);
     placeholder_row.set_activatable(false);

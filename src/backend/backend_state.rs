@@ -220,6 +220,12 @@ impl BackendState {
                 Self::scale_image(png_bytes),
             )
         } else {
+            if !mime_content.contains_key("text/plain") {
+                if let Some(txt_bytes) = mime_content.get("text/plain;charset=utf-8") {
+                    let txt_bytes = txt_bytes.clone();
+                    mime_content.insert("text/plain".to_string(), txt_bytes);
+                }
+            }
             // Otherwise, if we have text/plain;charset=utf-8, show up to first 200 chars and infer type
             let preview: String =
                 if let Some(txt_bytes) = mime_content.get("text/plain;charset=utf-8") {
