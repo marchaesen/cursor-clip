@@ -19,17 +19,23 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 const PASTE_KEYMAP: &[u8] = b"xkb_keymap {\n\
 xkb_keycodes \"(unnamed)\" {\n\
 minimum = 8;\n\
-maximum = 11;\n\
+maximum = 12;\n\
 <K1> = 9;\n\
 <K2> = 10;\n\
+<K3> = 11;\n\
 };\n\
 xkb_types \"(unnamed)\" { include \"complete\" };\n\
 xkb_compatibility \"(unnamed)\" { include \"complete\" };\n\
 xkb_symbols \"(unnamed)\" {\n\
 key <K1> {[Control_L]};\n\
 key <K2> {[v, V]};\n\
+key <K3> {[Shift_L]};\n\
 };\n\
 };\n\0";
+
+// XKB default modifier mask bits.
+const MOD_SHIFT: u32 = 1;
+const MOD_CONTROL: u32 = 4;
 
 struct VirtualKeyboardState;
 
@@ -49,7 +55,10 @@ delegate_noop!(VirtualKeyboardState: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(VirtualKeyboardState: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(VirtualKeyboardState: ignore WlSeat);
 
-pub fn paste_via_virtual_keyboard(text: Option<&str>) -> Result<(), String> {
+/// Type `text` into the focused window, or synthesize a paste shortcut when
+/// `text` is `None`. For the shortcut, `use_shift` sends Ctrl+Shift+V
+/// (terminals) instead of plain Ctrl+V (GUI text fields).
+pub fn paste_via_virtual_keyboard(text: Option<&str>, use_shift: bool) -> Result<(), String> {
     let connection =
         Connection::connect_to_env().map_err(|e| format!("Wayland connection failed: {e}"))?;
     let (globals, event_queue) =
@@ -71,7 +80,7 @@ pub fn paste_via_virtual_keyboard(text: Option<&str>) -> Result<(), String> {
     } else {
         set_keymap(&keyboard, PASTE_KEYMAP)?;
         connection.roundtrip().map_err(|e| e.to_string())?;
-        paste_shortcut(&connection, &keyboard)?;
+        paste_shortcut(&connection, &keyboard, use_shift)?;
     }
     keyboard.destroy();
     connection.roundtrip().map_err(|e| e.to_string())?;
@@ -161,14 +170,29 @@ fn type_text(
     }
 }
 
-fn paste_shortcut(connection: &Connection, keyboard: &ZwpVirtualKeyboardV1) -> Result<(), String> {
-    // Press Ctrl, declare modifiers, tap V, then clear modifiers and release Ctrl.
-    // Some clients only honor Ctrl combinations when modifier state is sent explicitly.
+fn paste_shortcut(
+    connection: &Connection,
+    keyboard: &ZwpVirtualKeyboardV1,
+    use_shift: bool,
+) -> Result<(), String> {
+    // Press Ctrl (and optionally Shift), declare modifiers, tap V, then clear
+    // modifiers and release the held keys. Some clients only honor modifier
+    // combinations when the modifier state is sent explicitly.
+    // Keycodes: 1 = Control_L (<K1>), 2 = v (<K2>), 3 = Shift_L (<K3>).
+    let mods = if use_shift {
+        MOD_CONTROL | MOD_SHIFT
+    } else {
+        MOD_CONTROL
+    };
+
     keyboard.key(0, 1, 1);
-    keyboard.modifiers(4, 0, 0, 0);
+    if use_shift {
+        keyboard.key(0, 3, 1);
+    }
+    keyboard.modifiers(mods, 0, 0, 0);
     connection
         .flush()
-        .map_err(|e| format!("Failed to flush Ctrl down: {e}"))?;
+        .map_err(|e| format!("Failed to flush modifier keys down: {e}"))?;
     sleep(Duration::from_millis(10));
 
     keyboard.key(0, 2, 1);
@@ -184,10 +208,19 @@ fn paste_shortcut(connection: &Connection, keyboard: &ZwpVirtualKeyboardV1) -> R
     sleep(Duration::from_millis(6));
 
     keyboard.modifiers(0, 0, 0, 0);
+    if use_shift {
+        keyboard.key(0, 3, 0);
+    }
     keyboard.key(0, 1, 0);
     connection
         .flush()
         .map_err(|e| format!("Failed to flush virtual keyboard shortcut: {e}"))?;
+
+    // Let the compositor process the key-up events before tearing the keyboard
+    // down. Destroying immediately after a bare flush can truncate the sequence
+    // on some compositors (e.g. cosmic-comp), so settle and round-trip first.
+    sleep(Duration::from_millis(20));
+    connection.roundtrip().map_err(|e| e.to_string())?;
 
     Ok(())
 }

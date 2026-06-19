@@ -1,4 +1,5 @@
 use super::selection::SelectionOwner;
+use crate::backend::active_window::focused_window_is_terminal;
 use crate::backend::persistence::{open_persistent_store, read_db_password_from_keyring_once};
 use crate::backend::store::{ClipboardStore, MAX_HISTORY_ITEMS, OpenBlob, next_item_id};
 use crate::backend::virtual_keyboard::paste_via_virtual_keyboard;
@@ -360,7 +361,8 @@ impl BackendState {
         if instant_paste {
             let expires_at = item.expires_at();
             std::thread::spawn(move || {
-                // Wait for focus to return to the previous app before sending any keys.
+                // Give the overlay time to close and the compositor to release its
+                // exclusive keyboard grab and refocus the previous app.
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 if expires_at.is_some_and(|expiry| expiry <= unix_timestamp()) {
                     return;
@@ -368,9 +370,10 @@ impl BackendState {
                 let result = match typing_payload {
                     Some((blob, charset)) => blob.read().and_then(|bytes| {
                         let text = decode_typing_text(bytes, &charset);
-                        paste_via_virtual_keyboard(text.as_deref())
+                        paste_via_virtual_keyboard(text.as_deref(), false)
                     }),
-                    None => paste_via_virtual_keyboard(None),
+                    // Terminals paste with Ctrl+Shift+V; GUI text fields use Ctrl+V.
+                    None => paste_via_virtual_keyboard(None, focused_window_is_terminal()),
                 };
                 if let Err(e) = result {
                     warn!("Instant paste failed: {e}");
