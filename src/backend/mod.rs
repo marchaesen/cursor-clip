@@ -1,3 +1,4 @@
+pub mod active_window;
 pub mod backend_state;
 pub mod ipc_server;
 pub mod persistence;
