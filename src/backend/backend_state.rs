@@ -3,6 +3,7 @@ use crate::backend::persistence::{
     load_persistence_enabled_from_config, read_db_password_from_keyring_once,
     warn_persistence_sync_error,
 };
+use crate::backend::active_window::focused_window_is_terminal;
 use crate::backend::virtual_keyboard::paste_via_virtual_keyboard_shortcut;
 use crate::backend::wayland_clipboard::MutexBackendState; // for QueueHandle type
 use fast_image_resize as fir;
@@ -427,9 +428,12 @@ impl BackendState {
         if instant_paste {
             info!("Instant paste via virtual keyboard shortcut for ID {entry_id}");
             std::thread::spawn(move || {
-                // Give the overlay a brief moment to close so shortcut targets the previous app.
+                // Give the overlay time to close and the compositor to release its
+                // exclusive keyboard grab and refocus the previous app.
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                if let Err(e) = paste_via_virtual_keyboard_shortcut() {
+                // Terminals paste with Ctrl+Shift+V; GUI text fields use Ctrl+V.
+                let use_shift = focused_window_is_terminal();
+                if let Err(e) = paste_via_virtual_keyboard_shortcut(use_shift) {
                     warn!("Instant paste failed: {e}");
                 }
             });
