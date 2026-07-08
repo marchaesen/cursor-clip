@@ -287,11 +287,17 @@ impl BackendState {
     }
 
     pub fn clear_history(&mut self) {
-        self.history.clear();
+        let source_item_survives = self
+            .owned_entry_id()
+            .and_then(|id| self.history.iter().find(|i| i.item_id == id))
+            .is_some_and(|item| item.pinned);
 
-        // If we clear history while owning a selection source, drop it and
-        // re-enable selection reads so external copies keep being tracked.
-        if let Some(owner) = &mut self.selection {
+        self.history.retain(|item| item.pinned);
+
+        // If we clear history while owning a selection source that didn't
+        // survive the clear, drop it and re-enable selection reads so
+        // external copies keep being tracked.
+        if !source_item_survives && let Some(owner) = &mut self.selection {
             owner.clear();
         }
 
