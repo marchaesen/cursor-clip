@@ -1,1 +1,6 @@
 /target
+/.flatpak-builder
+/build-flatpak
+/repo
+
+*.xcf
