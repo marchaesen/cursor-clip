@@ -31,7 +31,10 @@ pub struct UserConfig {
     pub persistence_enabled: bool,
     pub instant_paste: bool,
     pub type_instead_of_paste: bool,
+    // Older builds stored the dragged size as `window_width`/`window_height`.
+    #[serde(alias = "window_width")]
     pub width: i32,
+    #[serde(alias = "window_height")]
     pub height: i32,
     pub position: PopupPosition,
     pub margin: i32,

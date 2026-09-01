@@ -26,6 +26,13 @@ static INIT: Once = Once::new();
 pub static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 const OVERLAY_MIN_WIDTH: i32 = 200;
+/// Smallest list height a drag on a resize grip can shrink the list to.
+const MIN_LIST_HEIGHT: i32 = 120;
+/// The card is undecorated, so resizing runs through our own grips.
+const RESIZE_HANDLE_THICKNESS: i32 = 6;
+const RESIZE_CORNER_SIZE: i32 = 14;
+/// Approximate header bar height, used to keep its buttons out of the resize strip.
+const HEADER_BAR_HEIGHT: i32 = 42;
 
 // Thread-local storage for the overlay state since GTK objects aren't Send/Sync
 thread_local! {
@@ -78,6 +85,14 @@ struct OverlayContent {
     history_state: HistoryListState,
     search_entry: SearchEntry,
     menu_revealer: Revealer,
+    resize_handles: Vec<ResizeHandle>,
+}
+
+/// A drag strip that resizes the card along the given axes.
+struct ResizeHandle {
+    widget: Box,
+    horizontal: bool,
+    vertical: bool,
 }
 
 /// The built overlay: window plus the parts that are reset on every show.
@@ -466,6 +481,7 @@ fn create_layer_shell_window(
         position: config.position,
         margin: config.margin,
         cursor: location.cursor,
+        pinned: None,
     }));
     let content = generate_overlay_content(config);
     let card = content.overlay.clone();
@@ -482,6 +498,7 @@ fn create_layer_shell_window(
     content
         .list_size
         .connect_apply(&config_path(), placement.clone());
+    attach_resize_gestures(&backdrop, &card, &content, &placement, &config_path());
     content.search_entry.connect_visible_notify({
         let size = Rc::downgrade(&content.list_size);
         let window = window.downgrade();
@@ -612,6 +629,8 @@ fn show_resident_overlay() {
             placement.position = config.position;
             placement.margin = config.margin;
         }
+        // A resize only lasts for the show it was made in.
+        placement.pinned = None;
 
         ui.history_state.search_query.borrow_mut().clear();
         ui.search_entry.set_text("");
@@ -687,15 +706,22 @@ impl ListSize {
         self.error.set_visible(false);
     }
 
+    fn header_minimum(&self) -> i32 {
+        self.header.measure(Orientation::Horizontal, -1).0
+    }
+
+    /// Size the list for an output of `area_width` × `area_height`. A
+    /// dimension of 0 means the output size is not known yet.
     fn apply(&self, area_width: i32, area_height: i32, placement: CardPlacement) {
         let (requested_width, requested_height) = self.requested.get();
-        let (header_min, _, _, _) = self.header.measure(Orientation::Horizontal, -1);
+        let header_min = self.header_minimum();
         let minimum = header_min.max(OVERLAY_MIN_WIDTH);
-        // The card CSS adds a one-pixel border on each side of the list.
+        // Only the output limits the width, as it does the height below. The
+        // card CSS adds a one-pixel border on each side of the list.
         let max_width = if area_width > 0 {
-            (placement.available(area_width) - 2).min(1200)
+            (placement.available(area_width) - 2).max(minimum)
         } else {
-            1200
+            i32::MAX
         };
         let width = requested_width.min(max_width).max(minimum);
         if requested_width < minimum
@@ -759,12 +785,12 @@ impl ListSize {
                 return;
             }
             size.set_requested(width, height);
-            let (width, height) = size
+            let (area_width, area_height) = size
                 .scrolled
                 .root()
                 .and_then(|r| r.downcast::<gtk4::Window>().ok())
                 .map_or((0, 0), |window| (window.width(), window.height()));
-            size.apply(width, height, placement.get());
+            size.apply(area_width, area_height, placement.get());
         });
     }
 }
@@ -774,6 +800,11 @@ struct CardPlacement {
     position: PopupPosition,
     margin: i32,
     cursor: (f64, f64),
+    /// Top-left the card keeps while it is being resized. The anchored origin
+    /// depends on the card's size, so a card pushed against an output edge
+    /// would slide as it changes size and its dragged border could not follow
+    /// the pointer. Reset every time the overlay is shown.
+    pinned: Option<(i32, i32)>,
 }
 
 impl CardPlacement {
@@ -790,6 +821,12 @@ impl CardPlacement {
         let top = self.margin.min(free_height);
         let right = free_width - left;
         let bottom = free_height - top;
+        if let Some((x, y)) = self.pinned {
+            return (
+                x.clamp(left, right.max(left)),
+                y.clamp(top, bottom.max(top)),
+            );
+        }
         match self.position {
             PopupPosition::Cursor => (
                 (self.cursor.0 as i32).clamp(left, right.max(left)),
@@ -847,6 +884,8 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     // Header bar
     let header_bar = adw::HeaderBar::new();
     let title = Label::new(Some("Clipboard History"));
+    // An un-ellipsized title pins the card's minimum width and blocks shrinking.
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     title.set_margin_start(30);
     title.set_margin_end(30);
     header_bar.set_title_widget(Some(&title));
@@ -1251,7 +1290,10 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
 
     let menu_revealer_toggle = menu_revealer.clone();
     three_dot_menu.connect_clicked(move |_| {
-        let next_state = !menu_revealer_toggle.is_child_revealed();
+        // Target state, not animation state: is_child_revealed() stays false
+        // until the transition finishes, so a second click during the
+        // animation would re-open instead of closing.
+        let next_state = !menu_revealer_toggle.reveals_child();
         menu_revealer_toggle.set_visible(next_state);
         menu_revealer_toggle.set_reveal_child(next_state);
     });
@@ -1293,10 +1335,25 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         dialog.present(Some(button));
     });
 
+    let resize_right = build_resize_handle("e-resize", Align::End, Align::Fill);
+    resize_right.set_size_request(RESIZE_HANDLE_THICKNESS, -1);
+    // Start below the header bar so the close and menu buttons stay fully clickable.
+    resize_right.set_margin_top(HEADER_BAR_HEIGHT);
+
+    let resize_bottom = build_resize_handle("s-resize", Align::Fill, Align::End);
+    resize_bottom.set_size_request(-1, RESIZE_HANDLE_THICKNESS);
+
+    let resize_corner = build_resize_handle("se-resize", Align::End, Align::End);
+    resize_corner.set_size_request(RESIZE_CORNER_SIZE, RESIZE_CORNER_SIZE);
+    resize_corner.add_css_class("resize-grip");
+
     let overlay = Overlay::new();
     overlay.set_child(Some(&main_box));
     overlay.add_overlay(&menu_revealer);
     overlay.set_measure_overlay(&menu_revealer, true);
+    overlay.add_overlay(&resize_right);
+    overlay.add_overlay(&resize_bottom);
+    overlay.add_overlay(&resize_corner);
 
     OverlayContent {
         persistence: persistence_controls,
@@ -1315,7 +1372,197 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         history_state,
         search_entry,
         menu_revealer,
+        resize_handles: vec![
+            ResizeHandle {
+                widget: resize_right,
+                horizontal: true,
+                vertical: false,
+            },
+            ResizeHandle {
+                widget: resize_bottom,
+                horizontal: false,
+                vertical: true,
+            },
+            ResizeHandle {
+                widget: resize_corner,
+                horizontal: true,
+                vertical: true,
+            },
+        ],
     }
+}
+
+/// Create a transparent drag strip used as a resize grip.
+fn build_resize_handle(cursor: &str, halign: Align, valign: Align) -> Box {
+    let handle = Box::new(Orientation::Horizontal, 0);
+    handle.set_halign(halign);
+    handle.set_valign(valign);
+    handle.set_cursor_from_name(Some(cursor));
+    handle
+}
+
+/// Where a resize drag started, so later updates are deltas from it.
+#[derive(Clone, Copy)]
+struct ResizeStart {
+    /// Pointer in backdrop (output) coordinates.
+    pointer: (f64, f64),
+    /// Top-left of the card in backdrop coordinates, held for the whole drag.
+    origin: (i32, i32),
+    /// Card size on screen.
+    card: (i32, i32),
+    /// Effective list size (the scrolled window's minimum content size).
+    list: (i32, i32),
+}
+
+/// Drive the list size from drags on the resize grips and persist the result.
+///
+/// The card's top-left is pinned for the drag. Otherwise the placement would
+/// recompute it from the anchor on every layout, and a card pushed against an
+/// output edge (or centered) would slide as it changes size instead of letting
+/// the dragged border follow the pointer. With the top-left fixed, the right
+/// and bottom borders move exactly as far as the pointer does.
+///
+/// The grips sit on the card, so they move as it grows. The backdrop covers the
+/// whole output and never moves, so the pointer is tracked in backdrop
+/// coordinates and the size is the start size plus the pointer travel since the
+/// drag began. The result is written through `ListSize`, the same path the
+/// width/height entries use.
+fn attach_resize_gestures(
+    backdrop: &Overlay,
+    card: &Overlay,
+    content: &OverlayContent,
+    placement: &Rc<Cell<CardPlacement>>,
+    config_file: &Path,
+) {
+    for handle in &content.resize_handles {
+        let gesture = gtk4::GestureDrag::new();
+        let horizontal = handle.horizontal;
+        let vertical = handle.vertical;
+        let start: Rc<Cell<Option<ResizeStart>>> = Rc::new(Cell::new(None));
+
+        gesture.connect_drag_begin({
+            let backdrop = backdrop.clone();
+            let card = card.clone();
+            let widget = handle.widget.clone();
+            let size = content.list_size.clone();
+            let placement = placement.clone();
+            let start = start.clone();
+            move |gesture, start_x, start_y| {
+                // Keep the header bar's window handle from taking the sequence.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let (Some(pointer), Some(corner)) = (
+                    point_in(&widget, &backdrop, start_x, start_y),
+                    point_in(&card, &backdrop, 0.0, 0.0),
+                ) else {
+                    return;
+                };
+                let origin = (corner.0.round() as i32, corner.1.round() as i32);
+                let mut current = placement.get();
+                current.pinned = Some(origin);
+                placement.set(current);
+                start.set(Some(ResizeStart {
+                    pointer,
+                    origin,
+                    card: (card.width(), card.height()),
+                    list: (
+                        size.scrolled.min_content_width(),
+                        size.scrolled.min_content_height(),
+                    ),
+                }));
+            }
+        });
+
+        gesture.connect_drag_update({
+            let backdrop = backdrop.clone();
+            let widget = handle.widget.clone();
+            let size = content.list_size.clone();
+            let placement = placement.clone();
+            let start = start.clone();
+            move |gesture, offset_x, offset_y| {
+                let (Some(begin), Some((start_x, start_y))) = (start.get(), gesture.start_point())
+                else {
+                    return;
+                };
+                // start_point + offset is the pointer in the grip's current
+                // coordinate space, which we then map into backdrop space.
+                let Some(pointer) =
+                    point_in(&widget, &backdrop, start_x + offset_x, start_y + offset_y)
+                else {
+                    return;
+                };
+
+                let margin = placement.get().margin;
+                let travel_x = (pointer.0 - begin.pointer.0).round() as i32;
+                let travel_y = (pointer.1 - begin.pointer.1).round() as i32;
+                let (requested_width, requested_height) = size.requested.get();
+
+                // The top-left is fixed, so the card may grow until its far
+                // border reaches the output margin.
+                let width = if horizontal {
+                    let lower = size.header_minimum().max(OVERLAY_MIN_WIDTH);
+                    let room = (backdrop.width() - margin - (begin.origin.0 + begin.card.0)).max(0);
+                    let upper = (begin.list.0 + room).max(lower);
+                    (begin.list.0 + travel_x).clamp(lower, upper)
+                } else {
+                    requested_width
+                };
+                let height = if vertical {
+                    let room =
+                        (backdrop.height() - margin - (begin.origin.1 + begin.card.1)).max(0);
+                    (begin.list.1 + travel_y).clamp(
+                        MIN_LIST_HEIGHT.min(begin.list.1),
+                        (begin.list.1 + room).max(begin.list.1),
+                    )
+                } else {
+                    requested_height
+                };
+
+                if size.requested.get() == (width, height) {
+                    return;
+                }
+                size.set_requested(width, height);
+                size.apply(backdrop.width(), backdrop.height(), placement.get());
+            }
+        });
+
+        gesture.connect_drag_end({
+            let size = content.list_size.clone();
+            let start = start.clone();
+            let config_file = config_file.to_owned();
+            move |_, _, _| {
+                if start.take().is_none() {
+                    return;
+                }
+                let (width, height) = size.requested.get();
+                let saved = UserConfig::read(&config_file)
+                    .is_ok_and(|config| config.width == width && config.height == height);
+                if saved {
+                    return;
+                }
+                if let Err(e) = UserConfig::update(&config_file, |config| {
+                    config.width = width;
+                    config.height = height;
+                }) {
+                    warn!("Failed to save window size: {}", e);
+                }
+            }
+        });
+
+        handle.widget.add_controller(gesture);
+    }
+}
+
+/// Translate a point from a widget's coordinate space into another widget's.
+fn point_in(
+    widget: &impl IsA<gtk4::Widget>,
+    target: &impl IsA<gtk4::Widget>,
+    x: f64,
+    y: f64,
+) -> Option<(f64, f64)> {
+    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+    widget
+        .compute_point(target, &point)
+        .map(|translated| (f64::from(translated.x()), f64::from(translated.y())))
 }
 
 /// Build the key controller: Esc hides and clears search or closes, arrows/Enter
@@ -1693,6 +1940,11 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             background-color: alpha(@popover_fg_color, 0.08);
         }
 
+        .resize-grip:hover {
+            background: alpha(@window_fg_color, 0.12);
+            border-radius: 0 0 6px 0;
+        }
+
         .menu-revealer {
             background: #2b2b2f;
             background: @popover_bg_color;
@@ -1860,6 +2112,11 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
         .settings-row:hover,
         .settings-row:focus-within {
             background-color: alpha(@popover_fg_color, 0.08);
+        }
+
+        .resize-grip:hover {
+            background: alpha(@window_fg_color, 0.12);
+            border-radius: 0 0 6px 0;
         }
 
         .menu-revealer {
@@ -2467,6 +2724,7 @@ mod size_tests {
             position: PopupPosition::Cursor,
             margin: 24,
             cursor: (125.0, 480.0),
+            pinned: None,
         };
         for (position, origin) in [
             (PopupPosition::Cursor, (125, 326)),
@@ -2485,6 +2743,40 @@ mod size_tests {
     }
 
     #[test]
+    fn a_pinned_card_keeps_its_top_left_while_it_changes_size() {
+        // Opened low on a 1000px output: the anchor pushes a 450px card up so
+        // that it ends at the bottom margin.
+        let mut placement = CardPlacement {
+            position: PopupPosition::Cursor,
+            margin: 5,
+            cursor: (100.0, 800.0),
+            pinned: None,
+        };
+        let card_height = |height: i32| (1000 - height, 1000);
+        let (free_height, _) = card_height(450);
+        assert_eq!(placement.origin(800, free_height), (100, 545));
+
+        // Unpinned, shrinking the card slides it down: the top edge moves and
+        // the bottom edge stays at the output margin, so a dragged bottom
+        // border could not follow the pointer.
+        let (free_height, _) = card_height(350);
+        assert_eq!(placement.origin(800, free_height), (100, 645));
+
+        // Pinned at drag start, the top stays put and the bottom border moves
+        // by exactly the size change, whichever way the card goes.
+        placement.pinned = Some((100, 545));
+        for height in [450, 350, 250, 450] {
+            let (free_height, _) = card_height(height);
+            let (_, top) = placement.origin(800, free_height);
+            assert_eq!((top, top + height), (545, 545 + height), "{height}");
+        }
+
+        // A pinned card that no longer fits is pulled back inside the margins.
+        let (free_height, _) = card_height(600);
+        assert_eq!(placement.origin(800, free_height), (100, 395));
+    }
+
+    #[test]
     #[ignore = "requires a GTK display"]
     fn oversized_list_fits_the_output_at_the_cursor_and_in_the_center() {
         adw::init().unwrap();
@@ -2498,6 +2790,7 @@ mod size_tests {
             position: config.position,
             margin: config.margin,
             cursor: (798.0, 599.0),
+            pinned: None,
         }));
         let content = generate_overlay_content(config);
         let window = adw::ApplicationWindow::builder().build();
@@ -2557,6 +2850,7 @@ mod size_tests {
             position: PopupPosition::BottomRight,
             margin: 24,
             cursor: (990.0, 540.0),
+            pinned: None,
         }));
         let root = create_backdrop(&content.overlay, placement.clone());
         window.set_content(Some(&root));
