@@ -46,8 +46,6 @@ fn run_main_event_loop(
                 gtk_overlay::OverlayGeometry {
                     x,
                     y,
-                    overlay_width: state.overlay_width,
-                    overlay_height: state.overlay_height,
                     monitor_width: state.monitor_width,
                     monitor_height: state.monitor_height,
                     monitor: None,
@@ -171,13 +169,10 @@ pub async fn run_frontend() -> Result<(), Box<dyn std::error::Error>> {
 
     // Hyprland can report the pointer position directly; no capture layer needed.
     if let Some(location) = hyprland::pointer_location() {
-        let defaults = State::new();
         return show_overlay(
             gtk_overlay::OverlayGeometry {
                 x: location.x,
                 y: location.y,
-                overlay_width: defaults.overlay_width,
-                overlay_height: defaults.overlay_height,
                 monitor_width: location.monitor_width,
                 monitor_height: location.monitor_height,
                 monitor: Some(location.monitor),

@@ -24,12 +24,24 @@ use std::os::fd::AsRawFd;
 static INIT: Once = Once::new();
 pub static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Fallback overlay size used before the user has resized the window once.
+const DEFAULT_OVERLAY_WIDTH: i32 = 200;
+const DEFAULT_OVERLAY_HEIGHT: i32 = 400;
+/// Smallest size the header bar and a readable list row still fit in.
+const MIN_OVERLAY_WIDTH: i32 = 200;
+const MIN_OVERLAY_HEIGHT: i32 = 160;
+/// The card is undecorated, so resizing runs through our own grips.
+const RESIZE_HANDLE_THICKNESS: i32 = 6;
+const RESIZE_CORNER_SIZE: i32 = 14;
+/// Keep the card clear of the monitor edge, matching the spawn clamp.
+const SCREEN_EDGE_MARGIN: i32 = 2;
+/// Approximate header bar height, used to keep its buttons out of the resize strip.
+const HEADER_BAR_HEIGHT: i32 = 42;
+
 #[derive(Clone)]
 pub struct OverlayGeometry {
     pub x: f64,
     pub y: f64,
-    pub overlay_width: i32,
-    pub overlay_height: i32,
     pub monitor_width: i32,
     pub monitor_height: i32,
     /// Output connector to open on; `None` lets the compositor choose
@@ -52,6 +64,8 @@ struct UserConfig {
     #[serde(alias = "persistent_history")]
     persistence_enabled: bool,
     instant_paste: bool,
+    window_width: i32,
+    window_height: i32,
 }
 
 #[derive(Clone)]
@@ -73,6 +87,15 @@ struct OverlayContent {
     history_state: HistoryListState,
     search_entry: SearchEntry,
     menu_revealer: Revealer,
+    config: Rc<RefCell<UserConfig>>,
+    resize_handles: Vec<ResizeHandle>,
+}
+
+/// A drag strip that resizes the card along the given axes.
+struct ResizeHandle {
+    widget: Box,
+    horizontal: bool,
+    vertical: bool,
 }
 
 /// The built overlay: window plus the parts that are reset on every show.
@@ -85,8 +108,8 @@ struct OverlayUi {
     menu_revealer: Revealer,
     /// Pointer position the card is anchored to, relative to the output
     card_target: Rc<Cell<(f64, f64)>>,
-    overlay_width: i32,
-    overlay_height: i32,
+    /// Card size the user asked for by dragging a grip (or restored from config)
+    card_size: Rc<Cell<(i32, i32)>>,
 }
 
 /// A hidden overlay kept in memory with its rows already laid out, so the
@@ -103,6 +126,8 @@ impl Default for UserConfig {
             show_pin: true,
             persistence_enabled: false,
             instant_paste: true,
+            window_width: DEFAULT_OVERLAY_WIDTH,
+            window_height: DEFAULT_OVERLAY_HEIGHT,
         }
     }
 }
@@ -303,8 +328,6 @@ fn create_layer_shell_window(
     let OverlayGeometry {
         x,
         y,
-        overlay_width,
-        overlay_height,
         monitor_width,
         monitor_height,
         monitor,
@@ -343,7 +366,7 @@ fn create_layer_shell_window(
     apply_custom_styling(&window);
 
     // Create and set content (also obtain list_box for navigation)
-    let content = generate_overlay_content(prefetched_items, overlay_width, overlay_height);
+    let content = generate_overlay_content(prefetched_items);
     let card = content.overlay.clone();
     card.add_css_class("cursor-clip-card");
     card.set_overflow(gtk4::Overflow::Hidden);
@@ -356,6 +379,21 @@ fn create_layer_shell_window(
     root.append(&card);
     window.set_content(Some(&root));
 
+    // Restore the size the user last dragged the card to. The card is only
+    // given a minimum size; the content can still make it larger.
+    let restored_size = {
+        let config = content.config.borrow();
+        clamp_card_size(
+            config.window_width,
+            config.window_height,
+            monitor_width,
+            monitor_height,
+            (SCREEN_EDGE_MARGIN, SCREEN_EDGE_MARGIN),
+        )
+    };
+    card.set_size_request(restored_size.0, restored_size.1);
+    let card_size = Rc::new(Cell::new(restored_size));
+
     // Position the card before the first frame using its natural size...
     let (_, natural_width, _, _) = card.measure(Orientation::Horizontal, -1);
     let (_, natural_height, _, _) = card.measure(Orientation::Vertical, natural_width);
@@ -363,35 +401,47 @@ fn create_layer_shell_window(
         &card,
         x,
         y,
-        natural_width.max(overlay_width),
-        natural_height.max(overlay_height),
+        natural_width.max(restored_size.0),
+        natural_height.max(restored_size.1),
         monitor_width,
         monitor_height,
     );
 
     // ...then clamp again with the real allocation, which also covers the
-    // case where the output size was unknown up front.
+    // case where the output size was unknown up front. The layer surface size
+    // is only known once the compositor has configured it, which can be
+    // several frames after map, so keep looking until there is a real
+    // allocation before shifting the card fully on screen.
     let card_target = Rc::new(Cell::new((x, y)));
     window.connect_map({
         let card = card.clone();
         let card_target = card_target.clone();
+        let card_size = card_size.clone();
         move |mapped_window| {
-            let mapped_window = mapped_window.clone();
             let card = card.clone();
-            let (x, y) = card_target.get();
-            gtk4::glib::idle_add_local_once(move || {
+            let card_target = card_target.clone();
+            let card_size = card_size.clone();
+            mapped_window.add_tick_callback(move |window, _| {
+                if window.width() <= 0 || window.height() <= 0 || card.width() <= 0 {
+                    return gtk4::glib::ControlFlow::Continue;
+                }
+                let (x, y) = card_target.get();
+                let (width, height) = card_size.get();
                 place_card(
                     &card,
                     x,
                     y,
-                    card.width().max(overlay_width),
-                    card.height().max(overlay_height),
-                    mapped_window.width(),
-                    mapped_window.height(),
+                    card.width().max(width),
+                    card.height().max(height),
+                    window.width(),
+                    window.height(),
                 );
+                gtk4::glib::ControlFlow::Break
             });
         }
     });
+
+    attach_resize_gestures(&window, &card, &content, &card_size);
 
     let backdrop_click = gtk4::GestureClick::new();
     backdrop_click.set_button(0);
@@ -449,8 +499,7 @@ fn create_layer_shell_window(
         search_entry: content.search_entry,
         menu_revealer: content.menu_revealer,
         card_target,
-        overlay_width,
-        overlay_height,
+        card_size,
     }
 }
 
@@ -514,12 +563,13 @@ fn show_resident_overlay() {
                 ui.window.set_monitor(Some(&gdk_monitor));
             }
             ui.card_target.set((location.x, location.y));
+            let (width, height) = ui.card_size.get();
             place_card(
                 &ui.card,
                 location.x,
                 location.y,
-                ui.card.width().max(ui.overlay_width),
-                ui.card.height().max(ui.overlay_height),
+                ui.card.width().max(width),
+                ui.card.height().max(height),
                 location.monitor_width,
                 location.monitor_height,
             );
@@ -549,7 +599,7 @@ fn place_card(
     area_height: i32,
 ) {
     let (left, top) = if area_width > 0 && area_height > 0 {
-        let margin = 2.0;
+        let margin = f64::from(SCREEN_EDGE_MARGIN);
         let max_x = (area_width as f64 - card_width as f64 - margin).max(margin);
         let max_y = (area_height as f64 - card_height as f64 - margin).max(margin);
         (x.clamp(margin, max_x), y.clamp(margin, max_y))
@@ -562,17 +612,15 @@ fn place_card(
 
 /// Create a Windows 11-style clipboard history list with provided (prefetched) backend data.
 /// Falls back to a lazy on-demand fetch only if the provided vector is empty.
-fn generate_overlay_content(
-    mut prefetched_items: Vec<ClipboardItemPreview>,
-    overlay_width: i32,
-    overlay_height: i32,
-) -> OverlayContent {
+fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> OverlayContent {
     // Main container with standard libadwaita spacing
     let main_box = Box::new(Orientation::Vertical, 0);
 
     // Header bar
     let header_bar = adw::HeaderBar::new();
     let title = Label::new(Some("Clipboard History"));
+    // An un-ellipsized title pins the card's minimum width and blocks shrinking.
+    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     title.set_margin_start(30);
     title.set_margin_end(30);
     header_bar.set_title_widget(Some(&title));
@@ -728,8 +776,10 @@ fn generate_overlay_content(
     // Create scrolled window for the clipboard list
     let scrolled_window = gtk4::ScrolledWindow::new();
     scrolled_window.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scrolled_window.set_min_content_width(overlay_width);
-    scrolled_window.set_min_content_height(overlay_height);
+    scrolled_window.set_min_content_width(MIN_OVERLAY_WIDTH);
+    scrolled_window.set_min_content_height(MIN_OVERLAY_HEIGHT);
+    // Absorb whatever height the window has beyond the header bar.
+    scrolled_window.set_vexpand(true);
 
     // Create list box for clipboard items
     let list_box = gtk4::ListBox::new();
@@ -944,7 +994,10 @@ fn generate_overlay_content(
 
     let menu_revealer_toggle = menu_revealer.clone();
     three_dot_menu.connect_clicked(move |_| {
-        let next_state = !menu_revealer_toggle.is_child_revealed();
+        // Target state, not animation state: is_child_revealed() stays false
+        // until the transition finishes, so a second click during the
+        // animation would re-open instead of closing.
+        let next_state = !menu_revealer_toggle.reveals_child();
         menu_revealer_toggle.set_visible(next_state);
         menu_revealer_toggle.set_reveal_child(next_state);
     });
@@ -981,9 +1034,24 @@ fn generate_overlay_content(
         dialog.present(Some(button));
     });
 
+    let resize_right = build_resize_handle("e-resize", Align::End, Align::Fill);
+    resize_right.set_size_request(RESIZE_HANDLE_THICKNESS, -1);
+    // Start below the header bar so the close and menu buttons stay fully clickable.
+    resize_right.set_margin_top(HEADER_BAR_HEIGHT);
+
+    let resize_bottom = build_resize_handle("s-resize", Align::Fill, Align::End);
+    resize_bottom.set_size_request(-1, RESIZE_HANDLE_THICKNESS);
+
+    let resize_corner = build_resize_handle("se-resize", Align::End, Align::End);
+    resize_corner.set_size_request(RESIZE_CORNER_SIZE, RESIZE_CORNER_SIZE);
+    resize_corner.add_css_class("resize-grip");
+
     let overlay = Overlay::new();
     overlay.set_child(Some(&main_box));
     overlay.add_overlay(&menu_revealer);
+    overlay.add_overlay(&resize_right);
+    overlay.add_overlay(&resize_bottom);
+    overlay.add_overlay(&resize_corner);
 
     OverlayContent {
         overlay,
@@ -991,7 +1059,193 @@ fn generate_overlay_content(
         history_state,
         search_entry,
         menu_revealer,
+        config: config_state,
+        resize_handles: vec![
+            ResizeHandle {
+                widget: resize_right,
+                horizontal: true,
+                vertical: false,
+            },
+            ResizeHandle {
+                widget: resize_bottom,
+                horizontal: false,
+                vertical: true,
+            },
+            ResizeHandle {
+                widget: resize_corner,
+                horizontal: true,
+                vertical: true,
+            },
+        ],
     }
+}
+
+/// Clamp a requested card size to the space between `origin` (the card's top
+/// left corner) and the edge of an `area_width` x `area_height` output. An
+/// unknown output size (0) leaves that axis unbounded. Used with a fixed
+/// origin when restoring, because a card that does not fit below the cursor is
+/// moved up rather than shrunk, and with the live origin while dragging a
+/// grip, so a resize stops at the screen edge instead of running off it.
+fn clamp_card_size(
+    width: i32,
+    height: i32,
+    area_width: i32,
+    area_height: i32,
+    origin: (i32, i32),
+) -> (i32, i32) {
+    let max_width = if area_width > 0 {
+        (area_width - origin.0 - SCREEN_EDGE_MARGIN).max(MIN_OVERLAY_WIDTH)
+    } else {
+        i32::MAX
+    };
+    let max_height = if area_height > 0 {
+        (area_height - origin.1 - SCREEN_EDGE_MARGIN).max(MIN_OVERLAY_HEIGHT)
+    } else {
+        i32::MAX
+    };
+
+    (
+        width.clamp(MIN_OVERLAY_WIDTH, max_width),
+        height.clamp(MIN_OVERLAY_HEIGHT, max_height),
+    )
+}
+
+/// Create a transparent drag strip used as a resize grip.
+fn build_resize_handle(cursor: &str, halign: Align, valign: Align) -> Box {
+    let handle = Box::new(Orientation::Horizontal, 0);
+    handle.set_halign(halign);
+    handle.set_valign(valign);
+    handle.set_cursor_from_name(Some(cursor));
+    handle
+}
+
+/// Drive the card size from drags on the resize grips and persist the result.
+///
+/// The grips sit at the right/bottom edge, so they move as the card grows.
+/// Tracking the raw drag offset would therefore fight itself: the widget shifts
+/// out from under the pointer and cancels the very offset driving the resize.
+/// The card is positioned by its top-left corner, so pointer coordinates
+/// expressed in *card* space are stable, and the size is simply "where the
+/// pointer is, plus the distance it was from the edge when the drag began".
+fn attach_resize_gestures(
+    window: &adw::ApplicationWindow,
+    card: &Overlay,
+    content: &OverlayContent,
+    card_size: &Rc<Cell<(i32, i32)>>,
+) {
+    for handle in &content.resize_handles {
+        let gesture = gtk4::GestureDrag::new();
+        let horizontal = handle.horizontal;
+        let vertical = handle.vertical;
+        // Distance from the pointer to the card edge when the drag started.
+        let grab_offset = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+
+        gesture.connect_drag_begin({
+            let window = window.clone();
+            let card = card.clone();
+            let widget = handle.widget.clone();
+            let grab_offset = grab_offset.clone();
+            let card_size = card_size.clone();
+            move |gesture, start_x, start_y| {
+                // Keep the header bar's window handle from taking the sequence.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let Some((pointer_x, pointer_y)) = pointer_in_card(&widget, &card, start_x, start_y)
+                else {
+                    return;
+                };
+                grab_offset.set((
+                    f64::from(card.width()) - pointer_x,
+                    f64::from(card.height()) - pointer_y,
+                ));
+
+                // Re-anchor to what is on screen: the content minimum may have
+                // made the card larger than the size we last asked for.
+                if card.width() > 0 && card.height() > 0 {
+                    card_size.set(clamp_card_size(
+                        card.width(),
+                        card.height(),
+                        window.width(),
+                        window.height(),
+                        (card.margin_start(), card.margin_top()),
+                    ));
+                }
+            }
+        });
+
+        gesture.connect_drag_update({
+            let window = window.clone();
+            let card = card.clone();
+            let widget = handle.widget.clone();
+            let grab_offset = grab_offset.clone();
+            let card_size = card_size.clone();
+            move |gesture, offset_x, offset_y| {
+                let Some((start_x, start_y)) = gesture.start_point() else {
+                    return;
+                };
+                // start_point + offset is the pointer's position in the grip's
+                // current coordinate space, which we then map into card space.
+                let Some((pointer_x, pointer_y)) =
+                    pointer_in_card(&widget, &card, start_x + offset_x, start_y + offset_y)
+                else {
+                    return;
+                };
+
+                let (grab_dx, grab_dy) = grab_offset.get();
+                let (last_width, last_height) = card_size.get();
+                let requested_width = if horizontal {
+                    (pointer_x + grab_dx).round() as i32
+                } else {
+                    last_width
+                };
+                let requested_height = if vertical {
+                    (pointer_y + grab_dy).round() as i32
+                } else {
+                    last_height
+                };
+                let size = clamp_card_size(
+                    requested_width,
+                    requested_height,
+                    window.width(),
+                    window.height(),
+                    (card.margin_start(), card.margin_top()),
+                );
+
+                if card_size.get() == size {
+                    return;
+                }
+                card_size.set(size);
+                card.set_size_request(size.0, size.1);
+            }
+        });
+
+        gesture.connect_drag_end({
+            let card_size = card_size.clone();
+            let config = content.config.clone();
+            move |_, _, _| {
+                let (width, height) = card_size.get();
+
+                let mut config = config.borrow_mut();
+                if config.window_width == width && config.window_height == height {
+                    return;
+                }
+                config.window_width = width;
+                config.window_height = height;
+                if let Err(e) = save_config(&config) {
+                    warn!("Failed to save window size: {}", e);
+                }
+            }
+        });
+
+        handle.widget.add_controller(gesture);
+    }
+}
+
+/// Translate a point from a grip's coordinate space into the card's.
+fn pointer_in_card(widget: &Box, card: &Overlay, x: f64, y: f64) -> Option<(f64, f64)> {
+    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+    widget
+        .compute_point(card, &point)
+        .map(|translated| (f64::from(translated.x()), f64::from(translated.y())))
 }
 
 /// Build the key controller: Esc hides and clears search or closes, arrows/Enter
@@ -1362,6 +1616,11 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             padding-right: 0;
         }
 
+
+        .resize-grip:hover {
+            background: alpha(@window_fg_color, 0.12);
+            border-radius: 0 0 6px 0;
+        }
         .menu-revealer {
             background: #2b2b2f;
             background: @popover_bg_color;
@@ -1520,6 +1779,11 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             padding-right: 0;
         }
 
+
+        .resize-grip:hover {
+            background: alpha(@window_fg_color, 0.12);
+            border-radius: 0 0 6px 0;
+        }
         .menu-revealer {
             background: #ffffff;
             background: @popover_bg_color;
