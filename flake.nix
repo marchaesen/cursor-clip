@@ -24,8 +24,10 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
 
+          # glib provides glib-compile-resources, which build.rs runs to bundle the icons.
           nativeBuildInputs = with pkgs; [
             pkg-config
+            glib
             wrapGAppsHook4
           ];
           buildInputs = with pkgs; [
