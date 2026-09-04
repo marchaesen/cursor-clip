@@ -1012,34 +1012,57 @@ fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> 
         menu_revealer_toggle.set_reveal_child(next_state);
     });
 
+    let list_box_for_clear = list_box.clone();
+    let history_state_for_clear = history_state.clone();
     clear_button.connect_clicked(move |button| {
         let dialog = adw::AlertDialog::new(
             Some("Clear clipboard history?"),
-            Some("All clipboard history items will be deleted. This cannot be undone."),
+            Some(
+                "All unpinned clipboard history items will be deleted. Pinned items are kept. \
+                 This cannot be undone.",
+            ),
         );
         dialog.add_response("cancel", "_Cancel");
         dialog.add_response("clear", "_Clear");
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
-        dialog.connect_response(None, |_, response| {
+        let list_box_for_clear = list_box_for_clear.clone();
+        let history_state_for_clear = history_state_for_clear.clone();
+        dialog.connect_response(None, move |_, response| {
             if response != "clear" {
                 return;
             }
-            match FrontendClient::new() {
-                Ok(mut client) => {
-                    if let Err(e) = client.clear_history() {
-                        error!("Error clearing clipboard history: {}", e);
-                    } else {
-                        info!("Clipboard history cleared");
-                        // Close the overlay after clearing.
-                        request_quit();
-                    }
-                }
+            let mut client = match FrontendClient::new() {
+                Ok(client) => client,
                 Err(e) => {
                     error!("Error creating frontend client: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = client.clear_history() {
+                error!("Error clearing clipboard history: {}", e);
+                return;
+            }
+
+            // Pinned items survive a clear, so ask the backend what is left
+            // rather than assuming the history is now empty. The overlay stays
+            // open and is refreshed in place.
+            match client.get_history() {
+                Ok(items) => *history_state_for_clear.all_items.borrow_mut() = items,
+                Err(e) => {
+                    warn!("Failed to reload clipboard history after clearing: {}", e);
+                    history_state_for_clear
+                        .all_items
+                        .borrow_mut()
+                        .retain(|item| item.pinned);
                 }
             }
+
+            info!("Clipboard history cleared");
+            rebuild_list(&list_box_for_clear, &history_state_for_clear);
+            select_first_row(&list_box_for_clear);
         });
         dialog.present(Some(button));
     });

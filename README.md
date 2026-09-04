@@ -228,7 +228,7 @@ Running the application requires a supported Wayland session (see Compositor Sup
 5. **Interact**:
    - **Click any item** to copy it back to the clipboard
    - **Scroll** through your clipboard history
-   - **Clear icon** on the left side of the header to remove all history items after confirming; choose **Cancel** or press `Esc` to keep them
+   - **Clear icon** on the left side of the header to remove all unpinned history items after confirming (pinned items are kept and the overlay stays open); choose **Cancel** or press `Esc` to keep them
    - **Delete** to remove a single item from history
    - **Pin** to keep an item permanently at the top of the list
    - **Close**: Press `Esc` or click anywhere outside the overlay
