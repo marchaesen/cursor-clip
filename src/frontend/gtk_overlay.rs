@@ -83,6 +83,7 @@ struct HistoryListState {
 
 struct OverlayContent {
     overlay: Overlay,
+    title_handle: Box,
     list_box: gtk4::ListBox,
     history_state: HistoryListState,
     search_entry: SearchEntry,
@@ -442,6 +443,7 @@ fn create_layer_shell_window(
     });
 
     attach_resize_gestures(&window, &card, &content, &card_size);
+    attach_move_gesture(&window, &card, &content, &card_size, &card_target);
 
     let backdrop_click = gtk4::GestureClick::new();
     backdrop_click.set_button(0);
@@ -618,12 +620,20 @@ fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> 
 
     // Header bar
     let header_bar = adw::HeaderBar::new();
-    let title = Label::new(Some("Clipboard History"));
     // An un-ellipsized title pins the card's minimum width and blocks shrinking.
-    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    title.set_margin_start(30);
-    title.set_margin_end(30);
-    header_bar.set_title_widget(Some(&title));
+    let title_label = Label::new(Some("Clipboard History"));
+    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    title_label.set_margin_start(30);
+    title_label.set_margin_end(30);
+    title_label.set_hexpand(true);
+    title_label.set_halign(Align::Center);
+    // The title fills the space between the header buttons and doubles as the
+    // area the card is dragged by.
+    let title_handle = Box::new(Orientation::Horizontal, 0);
+    title_handle.set_hexpand(true);
+    title_handle.set_cursor_from_name(Some("grab"));
+    title_handle.append(&title_label);
+    header_bar.set_title_widget(Some(&title_handle));
     header_bar.set_centering_policy(adw::CenteringPolicy::Strict);
     // Layer-shell + undecorated windows can render built-in title buttons unreliably.
     // Use an explicit close button styled like a normal Adwaita title button instead.
@@ -688,7 +698,7 @@ fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> 
     menu_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     menu_revealer.set_halign(Align::End);
     menu_revealer.set_valign(Align::Start);
-    menu_revealer.set_margin_top(26);
+    menu_revealer.set_margin_top(HEADER_BAR_HEIGHT);
     menu_revealer.set_margin_end(5);
     menu_revealer.add_css_class("menu-revealer");
 
@@ -1055,6 +1065,7 @@ fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> 
 
     OverlayContent {
         overlay,
+        title_handle,
         list_box,
         history_state,
         search_entry,
@@ -1117,6 +1128,80 @@ fn build_resize_handle(cursor: &str, halign: Align, valign: Align) -> Box {
     handle.set_valign(valign);
     handle.set_cursor_from_name(Some(cursor));
     handle
+}
+
+/// Move the card by dragging the header bar's title area.
+///
+/// The overlay surface covers the whole output and the card sits inside it at
+/// its margins, so the header bar's built-in drag support - which asks the
+/// compositor to move a toplevel - does nothing here. The position has to be
+/// driven from the card margins by hand.
+///
+/// Two details keep the card following the cursor:
+///
+/// The gesture claims its sequence up front. `adw::HeaderBar` wraps itself in a
+/// window handle carrying a drag gesture of its own, and that gesture takes the
+/// sequence over as soon as the 8px drag threshold is crossed - precisely where
+/// the movement otherwise stalls after a few pixels.
+///
+/// The offset is added to the card's *live* origin. Gesture coordinates are
+/// relative to the title area, which moves along with the card, so the offset
+/// already has the movement applied so far subtracted from it:
+/// `offset == travelled - applied`. Adding it to the live origin therefore
+/// lands on `start + travelled` and self-corrects, whereas anchoring to the
+/// origin captured at drag start subtracts the applied movement a second time
+/// and pulls the card back towards where it began.
+fn attach_move_gesture(
+    window: &adw::ApplicationWindow,
+    card: &Overlay,
+    content: &OverlayContent,
+    card_size: &Rc<Cell<(i32, i32)>>,
+    card_target: &Rc<Cell<(f64, f64)>>,
+) {
+    let gesture = gtk4::GestureDrag::new();
+
+    let handle_for_begin = content.title_handle.clone();
+    gesture.connect_drag_begin(move |gesture, _, _| {
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        handle_for_begin.set_cursor_from_name(Some("grabbing"));
+    });
+
+    gesture.connect_drag_update({
+        let window = window.clone();
+        let card = card.clone();
+        let card_size = card_size.clone();
+        let card_target = card_target.clone();
+        move |_, offset_x, offset_y| {
+            if window.width() <= 0 || window.height() <= 0 {
+                return;
+            }
+            // The content minimum can make the card larger than what we asked
+            // for, so keep whichever is bigger fully on screen.
+            let (requested_width, requested_height) = card_size.get();
+            let width = card.width().max(requested_width);
+            let height = card.height().max(requested_height);
+            let max_x = (window.width() - width - SCREEN_EDGE_MARGIN).max(SCREEN_EDGE_MARGIN);
+            let max_y = (window.height() - height - SCREEN_EDGE_MARGIN).max(SCREEN_EDGE_MARGIN);
+
+            let origin = (card.margin_start(), card.margin_top());
+            let x = (origin.0 + offset_x.round() as i32).clamp(SCREEN_EDGE_MARGIN, max_x);
+            let y = (origin.1 + offset_y.round() as i32).clamp(SCREEN_EDGE_MARGIN, max_y);
+
+            if (x, y) == origin {
+                return;
+            }
+            card_target.set((f64::from(x), f64::from(y)));
+            card.set_margin_start(x);
+            card.set_margin_top(y);
+        }
+    });
+
+    let handle_for_end = content.title_handle.clone();
+    gesture.connect_drag_end(move |_, _, _| {
+        handle_for_end.set_cursor_from_name(Some("grab"));
+    });
+
+    content.title_handle.add_controller(gesture);
 }
 
 /// Drive the card size from drags on the resize grips and persist the result.
