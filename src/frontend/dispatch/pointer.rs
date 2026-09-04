@@ -4,6 +4,9 @@ use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use crate::frontend::frontend_state::State;
 use log::debug;
 
+/// Linux input codes for the left, right and middle mouse buttons.
+const DISMISS_BUTTONS: [u32; 3] = [272, 273, 274];
+
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
         state: &mut Self,
@@ -66,12 +69,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => {
                 debug!("Pointer button {button:?} at time {time}: {button_state:?}");
 
-                // Check for left mouse button click (button 272 = left click)
-                if button == 272
+                // The capture layer only receives presses that miss the
+                // overlay window, so any of them dismisses the overlay.
+                if DISMISS_BUTTONS.contains(&button)
                     && let WEnum::Value(wl_pointer::ButtonState::Pressed) = button_state
                 {
-                    debug!("Left mouse button clicked on capture layer - requesting close");
-                    state.capture_layer_clicked = true; // future handling of outside click to close overlay
+                    debug!("Mouse button {button} pressed on capture layer - requesting close");
+                    state.capture_layer_clicked = true;
                 }
             }
             _ => {}
