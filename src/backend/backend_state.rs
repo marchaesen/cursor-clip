@@ -547,6 +547,13 @@ impl BackendState {
         }
         debug!("Created clipboard source and set selection (id {entry_id})");
 
+        // Using an entry promotes it within its group, so it sits at hand the
+        // next time the overlay opens. An entry already at the top does not
+        // move, which keeps an external copy from persisting the history twice.
+        if self.move_to_top_of_group(entry_id) {
+            self.history_changed();
+        }
+
         if instant_paste {
             info!("Instant paste via virtual keyboard shortcut for ID {entry_id}");
             std::thread::spawn(move || {
@@ -571,10 +578,34 @@ impl BackendState {
             .position(|item| item.item_id == entry_id)
             .ok_or_else(|| format!("No clipboard item found with ID: {entry_id}"))?;
 
-        let mut item = self.history.remove(index);
-        item.pinned = pinned;
+        self.history[index].pinned = pinned;
+        self.move_to_top_of_group(entry_id);
+        self.history_changed();
+        Ok(())
+    }
 
-        let insert_index = if pinned {
+    /// Move an entry above the others in its own half of the list: pinned
+    /// entries ahead of the pinned ones, unpinned entries ahead of the unpinned
+    /// ones. The timestamp is refreshed along with it, because using an entry
+    /// does make it the newest clipboard content and the order should stay
+    /// consistent with it across restarts. Password-manager entries keep their
+    /// timestamp: it drives their expiry, which using them must not extend.
+    ///
+    /// Returns whether anything changed, so that callers can skip persisting an
+    /// entry that already sits at the top of its group.
+    fn move_to_top_of_group(&mut self, entry_id: u64) -> bool {
+        let Some(index) = self
+            .history
+            .iter()
+            .position(|item| item.item_id == entry_id)
+        else {
+            return false;
+        };
+
+        // Work out the target without the entry itself in the list, so an
+        // entry that was just unpinned lands below every remaining pinned one.
+        let mut item = self.history.remove(index);
+        let target_index = if item.pinned {
             0
         } else {
             self.history
@@ -583,9 +614,16 @@ impl BackendState {
                 .unwrap_or(self.history.len())
         };
 
-        self.history.insert(insert_index, item);
-        self.history_changed();
-        Ok(())
+        if index == target_index {
+            self.history.insert(index, item);
+            return false;
+        }
+
+        if item.expires_at().is_none() {
+            item.timestamp = unix_timestamp();
+        }
+        self.history.insert(target_index, item);
+        true
     }
 
     pub fn set_persistence_enabled(&mut self, enabled: bool) -> Result<(), String> {
