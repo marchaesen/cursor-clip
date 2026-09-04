@@ -111,6 +111,10 @@ pub struct ClipboardItemPreview {
     pub timestamp: u64, // Unix timestamp
     #[serde(default)]
     pub pinned: bool,
+    /// Whether this entry is the one currently held in the clipboard. Set when
+    /// the backend answers a history request, not stored with the item.
+    #[serde(default)]
+    pub active: bool,
     pub thumbnail: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
@@ -124,6 +128,7 @@ impl From<&ClipboardItem> for ClipboardItemPreview {
             content_type: full.content_type,
             timestamp: full.timestamp,
             pinned: full.pinned,
+            active: false,
             thumbnail: full.thumbnail.clone(),
             expires_at: full.expires_at(),
         }
