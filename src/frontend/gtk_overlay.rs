@@ -35,6 +35,16 @@ const RESIZE_HANDLE_THICKNESS: i32 = 6;
 const RESIZE_CORNER_SIZE: i32 = 14;
 /// Keep the card clear of the monitor edge, matching the spawn clamp.
 const SCREEN_EDGE_MARGIN: i32 = 2;
+
+/// Resource path the bundled icons are registered under, and the pin they hold.
+/// Shipping the pin ourselves keeps the pinned state looking identical on every
+/// desktop rather than depending on whichever icon theme is installed.
+const BUNDLED_ICON_RESOURCE_PATH: &str = "/io/github/sirulex/cursor-clip/icons";
+const PIN_ICON: &str = "cursor-clip-pin-symbolic";
+const PIN_ICON_PIXEL_SIZE: i32 = 16;
+/// A red bar drawn diagonally across the pin marks an unpinned row.
+const PIN_SLASH_LENGTH: i32 = 16;
+const PIN_SLASH_THICKNESS: i32 = 2;
 /// Approximate header bar height, used to keep its buttons out of the resize strip.
 const HEADER_BAR_HEIGHT: i32 = 42;
 
@@ -214,6 +224,7 @@ pub fn init_clipboard_overlay(
 ) -> Result<(), std::boxed::Box<dyn std::error::Error + Send + Sync>> {
     INIT.call_once(|| {
         adw::init().expect("Failed to initialize libadwaita");
+        register_bundled_icons();
     });
     configure_color_scheme();
 
@@ -1675,6 +1686,13 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             color: @accent_color;
         }
 
+        .pin-slash {
+            background-color: #ff7b63;
+            background-color: @error_color;
+            border-radius: 1px;
+            transform: rotate(-45deg);
+        }
+
         .manual-close-button {
             min-width: 28px;
             min-height: 28px;
@@ -1838,6 +1856,13 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             color: @accent_color;
         }
 
+        .pin-slash {
+            background-color: #c01c28;
+            background-color: @error_color;
+            border-radius: 1px;
+            transform: rotate(-45deg);
+        }
+
         .manual-close-button {
             min-width: 28px;
             min-height: 28px;
@@ -1906,6 +1931,54 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
     });
 }
 
+/// Make the icons compiled in by `build.rs` visible to the icon theme, so the
+/// pin renders identically no matter which desktop the overlay runs on.
+fn register_bundled_icons() {
+    if let Err(e) = gtk4::gio::resources_register_include!("cursor-clip.gresource") {
+        warn!("Failed to register bundled icons: {e}");
+        return;
+    }
+
+    let Some(display) = gtk4::gdk::Display::default() else {
+        warn!("No display available; bundled icons were not added to the icon theme");
+        return;
+    };
+    let icon_theme = gtk4::IconTheme::for_display(&display);
+    icon_theme.add_resource_path(BUNDLED_ICON_RESOURCE_PATH);
+
+    // Without this the only symptom would be a broken-image placeholder on
+    // every row, which is easy to miss and hard to trace back.
+    if !icon_theme.has_icon(PIN_ICON) {
+        warn!("Bundled icon {PIN_ICON} did not resolve after registering its resource path");
+    }
+}
+
+/// The pin shown on a row: the bare glyph when the item is pinned, and the same
+/// glyph behind a red diagonal bar when it is not - the convention most
+/// interfaces use for a disabled state. The bar is a styled widget rather than
+/// a second icon because no icon theme ships a crossed out pin to pair with.
+fn build_pin_icon(pinned: bool) -> gtk4::Widget {
+    let image = gtk4::Image::from_icon_name(PIN_ICON);
+    image.set_pixel_size(PIN_ICON_PIXEL_SIZE);
+
+    if pinned {
+        return image.upcast();
+    }
+
+    let slash = Box::new(Orientation::Horizontal, 0);
+    slash.add_css_class("pin-slash");
+    slash.set_size_request(PIN_SLASH_LENGTH, PIN_SLASH_THICKNESS);
+    slash.set_halign(Align::Center);
+    slash.set_valign(Align::Center);
+    // The bar is decoration; clicks belong to the button underneath it.
+    slash.set_can_target(false);
+
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&image));
+    overlay.add_overlay(&slash);
+    overlay.upcast()
+}
+
 /// Create a clipboard history item row from backend data
 fn generate_listboxrow_from_preview(
     item: &ClipboardItemPreview,
@@ -1940,7 +2013,8 @@ fn generate_listboxrow_from_preview(
     time_label.add_css_class("clipboard-time");
     time_label.set_halign(Align::End);
 
-    let pin_button = Button::builder().icon_name("view-pin-symbolic").build();
+    let pin_button = Button::new();
+    pin_button.set_child(Some(&build_pin_icon(item.pinned)));
     pin_button.add_css_class("flat");
     pin_button.add_css_class("clipboard-pin");
     if item.pinned {

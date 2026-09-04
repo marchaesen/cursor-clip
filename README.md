@@ -111,7 +111,7 @@ Super+V.
 
 #### Arch Linux:
 ```bash
-sudo pacman -S gtk4 libadwaita gtk4-layer-shell
+sudo pacman -S gtk4 libadwaita gtk4-layer-shell glib2-devel
 ```
 
 #### Ubuntu/Debian:
@@ -124,6 +124,11 @@ sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev libgtk
 ```bash
 sudo dnf install gtk4-devel libadwaita-devel gtk4-layer-shell
 ```
+
+The build script bundles the application's icons with `glib-compile-resources`,
+which ships with glib's development files (`libglib2.0-dev` on Debian/Ubuntu and
+`glib2-devel` on Fedora, both pulled in by the GTK packages above; a separate
+`glib2-devel` package on Arch).
 
 
 ### Download and Compile
