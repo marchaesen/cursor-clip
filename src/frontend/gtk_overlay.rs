@@ -81,6 +81,7 @@ struct OverlayContent {
     persistence: Rc<PersistenceControls>,
     overlay: Overlay,
     list_size: Rc<ListSize>,
+    title_handle: Box,
     list_box: gtk4::ListBox,
     history_state: HistoryListState,
     search_entry: SearchEntry,
@@ -481,6 +482,7 @@ fn create_layer_shell_window(
         position: config.position,
         margin: config.margin,
         cursor: location.cursor,
+        offset: (0, 0),
         pinned: None,
     }));
     let content = generate_overlay_content(config);
@@ -499,6 +501,7 @@ fn create_layer_shell_window(
         .list_size
         .connect_apply(&config_path(), placement.clone());
     attach_resize_gestures(&backdrop, &card, &content, &placement, &config_path());
+    attach_move_gesture(&backdrop, &card, &content, &placement);
     content.search_entry.connect_visible_notify({
         let size = Rc::downgrade(&content.list_size);
         let window = window.downgrade();
@@ -629,7 +632,8 @@ fn show_resident_overlay() {
             placement.position = config.position;
             placement.margin = config.margin;
         }
-        // A resize only lasts for the show it was made in.
+        // A drag only lasts for the show it was made in.
+        placement.offset = (0, 0);
         placement.pinned = None;
 
         ui.history_state.search_query.borrow_mut().clear();
@@ -800,10 +804,14 @@ struct CardPlacement {
     position: PopupPosition,
     margin: i32,
     cursor: (f64, f64),
+    /// How far the user dragged the card away from its anchored origin.
+    /// Reset every time the overlay is shown.
+    offset: (i32, i32),
     /// Top-left the card keeps while it is being resized. The anchored origin
     /// depends on the card's size, so a card pushed against an output edge
     /// would slide as it changes size and its dragged border could not follow
-    /// the pointer. Reset every time the overlay is shown.
+    /// the pointer. Folded into `offset` when the card is moved, and reset
+    /// every time the overlay is shown.
     pinned: Option<(i32, i32)>,
 }
 
@@ -816,17 +824,16 @@ impl CardPlacement {
         }
     }
 
-    fn origin(self, free_width: i32, free_height: i32) -> (i32, i32) {
+    /// Top-left and bottom-right corners of the space the card's origin may use.
+    fn bounds(self, free_width: i32, free_height: i32) -> ((i32, i32), (i32, i32)) {
         let left = self.margin.min(free_width);
         let top = self.margin.min(free_height);
-        let right = free_width - left;
-        let bottom = free_height - top;
-        if let Some((x, y)) = self.pinned {
-            return (
-                x.clamp(left, right.max(left)),
-                y.clamp(top, bottom.max(top)),
-            );
-        }
+        ((left, top), (free_width - left, free_height - top))
+    }
+
+    /// Where the configured position puts the card before any dragging.
+    fn anchor(self, free_width: i32, free_height: i32) -> (i32, i32) {
+        let ((left, top), (right, bottom)) = self.bounds(free_width, free_height);
         match self.position {
             PopupPosition::Cursor => (
                 (self.cursor.0 as i32).clamp(left, right.max(left)),
@@ -838,6 +845,32 @@ impl CardPlacement {
             PopupPosition::BottomLeft => (left, bottom),
             PopupPosition::BottomRight => (right, bottom),
         }
+    }
+
+    /// Limit a drag offset so the dragged card stays inside the margins.
+    fn clamp_offset(self, free_width: i32, free_height: i32, wanted: (i32, i32)) -> (i32, i32) {
+        let (x, y) = self.anchor(free_width, free_height);
+        let ((left, top), (right, bottom)) = self.bounds(free_width, free_height);
+        (
+            (x + wanted.0).clamp(left, right.max(left)) - x,
+            (y + wanted.1).clamp(top, bottom.max(top)) - y,
+        )
+    }
+
+    fn origin(self, free_width: i32, free_height: i32) -> (i32, i32) {
+        if let Some((x, y)) = self.pinned {
+            let ((left, top), (right, bottom)) = self.bounds(free_width, free_height);
+            return (
+                x.clamp(left, right.max(left)),
+                y.clamp(top, bottom.max(top)),
+            );
+        }
+        let (x, y) = self.anchor(free_width, free_height);
+        if self.offset == (0, 0) {
+            return (x, y);
+        }
+        let (dx, dy) = self.clamp_offset(free_width, free_height, self.offset);
+        (x + dx, y + dy)
     }
 }
 
@@ -883,12 +916,20 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
 
     // Header bar
     let header_bar = adw::HeaderBar::new();
-    let title = Label::new(Some("Clipboard History"));
     // An un-ellipsized title pins the card's minimum width and blocks shrinking.
-    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    title.set_margin_start(30);
-    title.set_margin_end(30);
-    header_bar.set_title_widget(Some(&title));
+    let title_label = Label::new(Some("Clipboard History"));
+    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    title_label.set_margin_start(30);
+    title_label.set_margin_end(30);
+    title_label.set_hexpand(true);
+    title_label.set_halign(Align::Center);
+    // The title fills the space between the header buttons and doubles as the
+    // area the card is dragged by.
+    let title_handle = Box::new(Orientation::Horizontal, 0);
+    title_handle.set_hexpand(true);
+    title_handle.set_cursor_from_name(Some("grab"));
+    title_handle.append(&title_label);
+    header_bar.set_title_widget(Some(&title_handle));
     header_bar.set_centering_policy(adw::CenteringPolicy::Strict);
     // Layer-shell + undecorated windows can render built-in title buttons unreliably.
     // Use an explicit close button styled like a normal Adwaita title button instead.
@@ -945,7 +986,7 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     menu_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     menu_revealer.set_halign(Align::End);
     menu_revealer.set_valign(Align::Start);
-    menu_revealer.set_margin_top(26);
+    menu_revealer.set_margin_top(HEADER_BAR_HEIGHT);
     menu_revealer.set_margin_end(5);
     menu_revealer.add_css_class("menu-revealer");
 
@@ -1368,6 +1409,7 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
             requested: Cell::new((config.width, config.height)),
             last_width: Cell::new(None),
         }),
+        title_handle,
         list_box,
         history_state,
         search_entry,
@@ -1399,6 +1441,123 @@ fn build_resize_handle(cursor: &str, halign: Align, valign: Align) -> Box {
     handle.set_valign(valign);
     handle.set_cursor_from_name(Some(cursor));
     handle
+}
+
+/// Where a move drag started: the pointer in backdrop coordinates and the
+/// placement offset at that moment.
+#[derive(Clone, Copy)]
+struct MoveStart {
+    pointer: (f64, f64),
+    offset: (i32, i32),
+}
+
+/// Move the card by dragging the header bar's title area.
+///
+/// The overlay surface covers the whole output and the card is placed inside
+/// it by `CardPlacement`, so the header bar's built-in drag support - which
+/// asks the compositor to move a toplevel - does nothing here. The drag is
+/// stored as an offset on the placement instead, which is clamped to the
+/// output and reset whenever the overlay is shown again.
+///
+/// Two details keep the card following the cursor:
+///
+/// The gesture claims its sequence up front. `adw::HeaderBar` wraps itself in a
+/// window handle carrying a drag gesture of its own, and that gesture takes the
+/// sequence over as soon as the 8px drag threshold is crossed - precisely where
+/// the movement otherwise stalls after a few pixels.
+///
+/// The pointer is tracked in backdrop coordinates. Gesture offsets are relative
+/// to the title area, which moves along with the card, so they already have the
+/// movement applied so far subtracted from them. The backdrop never moves, so
+/// "pointer now minus pointer at drag start" is the true travel.
+fn attach_move_gesture(
+    backdrop: &Overlay,
+    card: &Overlay,
+    content: &OverlayContent,
+    placement: &Rc<Cell<CardPlacement>>,
+) {
+    let gesture = gtk4::GestureDrag::new();
+    let start: Rc<Cell<Option<MoveStart>>> = Rc::new(Cell::new(None));
+
+    gesture.connect_drag_begin({
+        let backdrop = backdrop.clone();
+        let card = card.clone();
+        let handle = content.title_handle.clone();
+        let placement = placement.clone();
+        let start = start.clone();
+        move |gesture, start_x, start_y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            handle.set_cursor_from_name(Some("grabbing"));
+            // A resize pins the card where it is; moving continues from there.
+            let mut current = placement.get();
+            if current.pinned.is_some()
+                && let Some((x, y)) = point_in(&card, &backdrop, 0.0, 0.0)
+            {
+                let (anchor_x, anchor_y) = current.anchor(
+                    (backdrop.width() - card.width()).max(0),
+                    (backdrop.height() - card.height()).max(0),
+                );
+                current.offset = (x.round() as i32 - anchor_x, y.round() as i32 - anchor_y);
+                current.pinned = None;
+                placement.set(current);
+            }
+            if let Some(pointer) = point_in(&handle, &backdrop, start_x, start_y) {
+                start.set(Some(MoveStart {
+                    pointer,
+                    offset: placement.get().offset,
+                }));
+            }
+        }
+    });
+
+    gesture.connect_drag_update({
+        let backdrop = backdrop.clone();
+        let card = card.clone();
+        let handle = content.title_handle.clone();
+        let placement = placement.clone();
+        let start = start.clone();
+        move |gesture, offset_x, offset_y| {
+            let (Some(begin), Some((start_x, start_y))) = (start.get(), gesture.start_point())
+            else {
+                return;
+            };
+            if backdrop.width() <= 0 || backdrop.height() <= 0 {
+                return;
+            }
+            let Some(pointer) =
+                point_in(&handle, &backdrop, start_x + offset_x, start_y + offset_y)
+            else {
+                return;
+            };
+
+            let mut current = placement.get();
+            let wanted = (
+                begin.offset.0 + (pointer.0 - begin.pointer.0).round() as i32,
+                begin.offset.1 + (pointer.1 - begin.pointer.1).round() as i32,
+            );
+            let offset = current.clamp_offset(
+                (backdrop.width() - card.width()).max(0),
+                (backdrop.height() - card.height()).max(0),
+                wanted,
+            );
+            if offset == current.offset {
+                return;
+            }
+            current.offset = offset;
+            placement.set(current);
+            backdrop.queue_allocate();
+        }
+    });
+
+    gesture.connect_drag_end({
+        let handle = content.title_handle.clone();
+        move |_, _, _| {
+            start.set(None);
+            handle.set_cursor_from_name(Some("grab"));
+        }
+    });
+
+    content.title_handle.add_controller(gesture);
 }
 
 /// Where a resize drag started, so later updates are deltas from it.
@@ -2724,6 +2883,7 @@ mod size_tests {
             position: PopupPosition::Cursor,
             margin: 24,
             cursor: (125.0, 480.0),
+            offset: (0, 0),
             pinned: None,
         };
         for (position, origin) in [
@@ -2743,6 +2903,25 @@ mod size_tests {
     }
 
     #[test]
+    fn dragged_cards_stay_inside_the_output_margins() {
+        let mut placement = CardPlacement {
+            position: PopupPosition::Center,
+            margin: 24,
+            cursor: (0.0, 0.0),
+            offset: (30, -40),
+            pinned: None,
+        };
+        assert_eq!(placement.origin(500, 350), (280, 135));
+        // A drag past the edge is limited to the margin.
+        placement.offset = placement.clamp_offset(500, 350, (1000, -1000));
+        assert_eq!(placement.origin(500, 350), (476, 24));
+        // Dragging inward from a pinned corner works from that corner.
+        placement.position = PopupPosition::BottomRight;
+        placement.offset = (-100, -100);
+        assert_eq!(placement.origin(500, 350), (376, 226));
+    }
+
+    #[test]
     fn a_pinned_card_keeps_its_top_left_while_it_changes_size() {
         // Opened low on a 1000px output: the anchor pushes a 450px card up so
         // that it ends at the bottom margin.
@@ -2750,6 +2929,7 @@ mod size_tests {
             position: PopupPosition::Cursor,
             margin: 5,
             cursor: (100.0, 800.0),
+            offset: (0, 0),
             pinned: None,
         };
         let card_height = |height: i32| (1000 - height, 1000);
@@ -2790,6 +2970,7 @@ mod size_tests {
             position: config.position,
             margin: config.margin,
             cursor: (798.0, 599.0),
+            offset: (0, 0),
             pinned: None,
         }));
         let content = generate_overlay_content(config);
@@ -2850,6 +3031,7 @@ mod size_tests {
             position: PopupPosition::BottomRight,
             margin: 24,
             cursor: (990.0, 540.0),
+            offset: (0, 0),
             pinned: None,
         }));
         let root = create_backdrop(&content.overlay, placement.clone());
