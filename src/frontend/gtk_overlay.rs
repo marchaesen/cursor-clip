@@ -1340,13 +1340,18 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     });
 
     let history_for_clear = history_state.clone();
+    let list_box_for_clear = list_box.clone();
+    let controls_for_clear = persistence_controls.clone();
     clear_button.connect_clicked(move |button| {
         if !history_for_clear.can_act_on_rows() {
             return;
         }
         let dialog = adw::AlertDialog::new(
             Some("Clear clipboard history?"),
-            Some("All clipboard history items will be deleted. This cannot be undone."),
+            Some(
+                "All unpinned clipboard history items will be deleted. Pinned items are kept. \
+                 This cannot be undone.",
+            ),
         );
         dialog.add_response("cancel", "_Cancel");
         dialog.add_response("clear", "_Clear");
@@ -1354,24 +1359,35 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
         let history_for_response = history_for_clear.clone();
+        let list_box_for_response = list_box_for_clear.clone();
+        let controls_for_response = controls_for_clear.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "clear" || !history_for_response.can_act_on_rows() {
                 return;
             }
-            match FrontendClient::new() {
-                Ok(mut client) => {
-                    if let Err(e) = client.clear_history() {
-                        error!("Error clearing clipboard history: {}", e);
-                    } else {
-                        info!("Clipboard history cleared");
-                        // Close the overlay after clearing.
-                        request_quit();
-                    }
-                }
+            let mut client = match FrontendClient::new() {
+                Ok(client) => client,
                 Err(e) => {
                     error!("Error creating frontend client: {}", e);
+                    return;
                 }
+            };
+
+            if let Err(e) = client.clear_history() {
+                error!("Error clearing clipboard history: {}", e);
+                return;
             }
+
+            // Pinned items survive a clear and the overlay stays open: show
+            // that right away, then reload what the backend really kept.
+            info!("Clipboard history cleared");
+            history_for_response
+                .all_items
+                .borrow_mut()
+                .retain(|item| item.pinned);
+            rebuild_list(&list_box_for_response, &history_for_response);
+            select_first_row(&list_box_for_response);
+            refresh_history(controls_for_response.clone());
         });
         dialog.present(Some(button));
     });
