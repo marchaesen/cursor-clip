@@ -403,7 +403,13 @@ impl BackendState {
         self.expire_password_items(unix_timestamp());
         self.history
             .iter()
-            .map(ClipboardItemPreview::from)
+            .map(|item| {
+                let mut preview = ClipboardItemPreview::from(item);
+                // Ownership of the selection is taken for external copies too,
+                // so this tracks the clipboard whichever way it was filled.
+                preview.active = self.current_source_entry_id == Some(item.item_id);
+                preview
+            })
             .collect()
     }
 

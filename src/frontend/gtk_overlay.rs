@@ -490,10 +490,18 @@ fn create_layer_shell_window(
     );
     window.add_controller(key_controller);
 
-    // Start in the history list; typing reveals and focuses search on demand.
+    // Start in the history list on the entry that is actually in the
+    // clipboard; typing reveals and focuses search on demand.
+    //
+    // Focus goes on the row, not on the list: GtkListBox answers the arrow keys
+    // itself, from the row holding focus, and a list focused on itself has no
+    // such row and so ignores them. With no entry in the clipboard nothing is
+    // selected or focused - focusing the list then would hand it a cursor row
+    // and put a highlight back on the first entry.
     window.connect_map({
         let list_box = content.list_box.clone();
-        move |_| select_first_row(&list_box)
+        let history_state = content.history_state.clone();
+        move |_| select_initial_row(&list_box, &history_state, true)
     });
 
     // Add close request handler to ensure any window close goes through our logic
@@ -859,8 +867,10 @@ fn generate_overlay_content(mut prefetched_items: Vec<ClipboardItemPreview>) -> 
         })
     });
 
+    // rebuild_list already highlights whichever entry is actually in the
+    // clipboard (see select_initial_row). Focus is placed when the window is
+    // mapped: a widget cannot take focus before it belongs to a window.
     rebuild_list(&list_box, &history_state);
-    select_first_row(&list_box);
 
     // Handle item activation (Enter/Space/double-click) instead of mere selection
     let history_state_for_activation = history_state.clone();
@@ -1423,6 +1433,45 @@ fn generate_key_controller(
             return gtk4::glib::Propagation::Proceed;
         }
 
+        // Own the first keypress while the list holds no focus. With nothing
+        // selected the initial focus sits on a header button - GTK hands it to
+        // the first focusable widget and draws no focus ring for it, so the
+        // window looks inert while a button quietly holds focus.
+        //
+        // Arrow keys would move focus between those buttons instead of walking
+        // the list, so they move into the list instead, after which the
+        // ordinary navigation takes over. Enter and Space would fire that
+        // button; nothing is highlighted to explain why, so they are swallowed -
+        // unless GTK considers the focus visible because the user navigated
+        // there with the keyboard, which keeps tabbing to a button and pressing
+        // Enter working.
+        if !has_focus_within(&list_box_for_keys) {
+            let focus_visible = controller
+                .widget()
+                .and_then(|widget| widget.downcast::<gtk4::Window>().ok())
+                .is_some_and(|window| window.gets_focus_visible());
+            let selected = list_box_for_keys.selected_row().filter(is_row_shown);
+            match key {
+                Key::Up | Key::KP_Up | Key::Down | Key::KP_Down
+                    if selected.is_none() || !focus_visible =>
+                {
+                    match selected {
+                        Some(row) => {
+                            row.grab_focus();
+                        }
+                        None => select_first_row(&list_box_for_keys),
+                    };
+                    return gtk4::glib::Propagation::Stop;
+                }
+                Key::Return | Key::KP_Enter | Key::space | Key::KP_Space
+                    if selected.is_none() && !focus_visible =>
+                {
+                    return gtk4::glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         // Row shortcuts apply when a row itself is focused, not one of its
         // inline delete/pin buttons (those keep Enter/Space for activation).
         let focused = controller
@@ -1638,6 +1687,13 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             background: alpha(@accent_bg_color, 0.18);
         }
 
+        /* The entry currently in the clipboard. An inset bar rather than a
+           border, so hovering and selecting the row leave it visible. */
+        .clipboard-item.active {
+            box-shadow: inset 4px 0 0 #3584E4;
+            box-shadow: inset 4px 0 0 @accent_bg_color;
+        }
+
         .clipboard-preview {
             opacity: 0.9;
             color: @window_fg_color;
@@ -1806,6 +1862,13 @@ fn load_overlay_css(css_provider: &gtk4::CssProvider, is_dark: bool) {
             border-color: @accent_bg_color;
             background: alpha(#1c71d8, 0.12);
             background: alpha(@accent_bg_color, 0.12);
+        }
+
+        /* The entry currently in the clipboard. An inset bar rather than a
+           border, so hovering and selecting the row leave it visible. */
+        .clipboard-item.active {
+            box-shadow: inset 4px 0 0 #1c71d8;
+            box-shadow: inset 4px 0 0 @accent_bg_color;
         }
 
         .clipboard-preview {
@@ -1990,6 +2053,11 @@ fn generate_listboxrow_from_preview(
     let row = gtk4::ListBoxRow::new();
     row.add_css_class("clipboard-item");
     row.set_widget_name(&row_key(item));
+    if item.active {
+        // A marker of its own, because hover and selection both just recolour
+        // the border and would otherwise be indistinguishable from it.
+        row.add_css_class("active");
+    }
 
     let main_box = Box::new(Orientation::Vertical, 3);
     main_box.set_margin_top(4);
@@ -2187,9 +2255,15 @@ fn rebuild_list(list_box: &gtk4::ListBox, history_state: &HistoryListState) {
             return gtk4::glib::ControlFlow::Break;
         }
         let done = sync_rows(list_box, &history_state, ROWS_PER_FRAME);
-        // A search match may only exist once its row has been created.
+        // A search match, or the entry in the clipboard, may only exist once
+        // its row has been created.
         if list_box.selected_row().filter(is_row_shown).is_none() {
-            select_first_row_without_focus(list_box);
+            // Only take focus if the user is not typing a search meanwhile.
+            let grab_focus = list_box
+                .root()
+                .and_then(|root| root.focus())
+                .is_none_or(|widget| !widget.is::<gtk4::Text>());
+            select_initial_row(list_box, &history_state, grab_focus);
         }
         if done {
             gtk4::glib::ControlFlow::Break
@@ -2252,7 +2326,7 @@ fn apply_search_filter(list_box: &gtk4::ListBox, history_state: &HistoryListStat
         } else {
             "No matches found"
         });
-    select_first_row_without_focus(list_box);
+    select_initial_row(list_box, history_state, false);
 }
 
 /// Row widget name: item id, pinned state and a hash of what the row shows.
@@ -2262,6 +2336,8 @@ fn row_key(item: &ClipboardItemPreview) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     item.timestamp.hash(&mut hasher);
+    // The active marker is a style class set when the row is built.
+    item.active.hash(&mut hasher);
     item.content_preview.hash(&mut hasher);
     item.thumbnail.as_deref().hash(&mut hasher);
     format!(
@@ -2336,10 +2412,6 @@ fn select_first_row(list_box: &gtk4::ListBox) {
     select_first_row_with_focus(list_box, true);
 }
 
-fn select_first_row_without_focus(list_box: &gtk4::ListBox) {
-    select_first_row_with_focus(list_box, false);
-}
-
 fn select_first_row_with_focus(list_box: &gtk4::ListBox, grab_focus: bool) -> bool {
     let Some(row) = list_rows(list_box).into_iter().find(is_row_shown) else {
         list_box.unselect_all();
@@ -2400,6 +2472,44 @@ fn select_row_by_item_id(
         None => {
             select_first_row(list_box);
         }
+    }
+}
+
+/// The entry currently held in the clipboard, as reported by the backend.
+/// `None` when the backend owns no selection, which is the case in
+/// monitor-only mode.
+fn active_item_id(history_state: &HistoryListState) -> Option<u64> {
+    history_state
+        .all_items
+        .borrow()
+        .iter()
+        .find(|item| item.active)
+        .map(|item| item.item_id)
+}
+
+/// Select the row a list starts on. While searching that is the first match.
+/// Otherwise it is whichever entry is actually in the clipboard - and there
+/// may be none: the daemon owns the selection, so restarting the service
+/// leaves the clipboard empty. Nothing is highlighted then, rather than
+/// falling back to an arbitrary row.
+fn select_initial_row(list_box: &gtk4::ListBox, history_state: &HistoryListState, grab_focus: bool) {
+    if !history_state.search_query.borrow().trim().is_empty() {
+        select_first_row_with_focus(list_box, grab_focus);
+        return;
+    }
+    let active_row = active_item_id(history_state).and_then(|item_id| {
+        list_rows(list_box)
+            .into_iter()
+            .find(|row| row_item_id(row) == Some(item_id) && is_row_shown(row))
+    });
+    match active_row {
+        Some(row) => {
+            list_box.select_row(Some(&row));
+            if grab_focus {
+                row.grab_focus();
+            }
+        }
+        None => list_box.unselect_all(),
     }
 }
 
