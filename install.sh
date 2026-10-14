@@ -7,7 +7,7 @@ cargo build --release
 
 systemctl --user stop cursor-clip.service || true
 
-sudo cp ./target/release/cursor-clip /usr/local/bin
+sudo cp ./target/release/cursor-clip ./target/release/cursor-clip-toggle /usr/local/bin
 mkdir -p ~/.config/systemd/user/
 cp cursor-clip.service ~/.config/systemd/user/
 
