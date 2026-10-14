@@ -1,9 +1,9 @@
+use crate::backend::active_window::focused_window_is_terminal;
 use crate::backend::persistence::{
     db_has_persisted_items, generate_and_store_db_password, load_persistence_enabled_from_config,
     migrate_legacy_history, read_db_password_from_keyring_once, warn_persistence_sync_error,
 };
 use crate::backend::store::{ClipboardStore, OpenBlob};
-use crate::backend::active_window::focused_window_is_terminal;
 use crate::backend::virtual_keyboard::paste_via_virtual_keyboard_shortcut;
 use crate::backend::wayland_clipboard::MutexBackendState; // for QueueHandle type
 use fast_image_resize as fir;

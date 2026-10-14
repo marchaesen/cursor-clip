@@ -1278,7 +1278,8 @@ fn attach_resize_gestures(
             move |gesture, start_x, start_y| {
                 // Keep the header bar's window handle from taking the sequence.
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                let Some((pointer_x, pointer_y)) = pointer_in_card(&widget, &card, start_x, start_y)
+                let Some((pointer_x, pointer_y)) =
+                    pointer_in_card(&widget, &card, start_x, start_y)
                 else {
                     return;
                 };
@@ -2492,7 +2493,11 @@ fn active_item_id(history_state: &HistoryListState) -> Option<u64> {
 /// may be none: the daemon owns the selection, so restarting the service
 /// leaves the clipboard empty. Nothing is highlighted then, rather than
 /// falling back to an arbitrary row.
-fn select_initial_row(list_box: &gtk4::ListBox, history_state: &HistoryListState, grab_focus: bool) {
+fn select_initial_row(
+    list_box: &gtk4::ListBox,
+    history_state: &HistoryListState,
+    grab_focus: bool,
+) {
     if !history_state.search_query.borrow().trim().is_empty() {
         select_first_row_with_focus(list_box, grab_focus);
         return;
