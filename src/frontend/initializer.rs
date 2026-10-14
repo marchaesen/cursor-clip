@@ -1,5 +1,6 @@
 use wayland_client::{
     Connection, EventQueue,
+    backend::{ReadEventsGuard, WaylandError},
     globals::{GlobalList, registry_queue_init},
     protocol::{wl_compositor, wl_seat, wl_shm},
 };
@@ -136,7 +137,7 @@ fn dispatch_wayland_or_toggle(
         }
 
         if poll_fds[0].revents != 0 {
-            read_guard.read()?;
+            read_wayland_events(read_guard)?;
             queue.dispatch_pending(state)?;
             return Ok(true);
         }
@@ -200,6 +201,17 @@ pub async fn run_frontend() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main event loop (reuse existing implementation)
     run_main_event_loop(&mut state, &mut queue, &toggle_server)
+}
+
+/// Read pending events from the socket. A readable socket can still have
+/// nothing to read yet (`WouldBlock`); that is not an error, the caller just
+/// polls again.
+fn read_wayland_events(read_guard: ReadEventsGuard) -> Result<(), WaylandError> {
+    match read_guard.read() {
+        Ok(_) => Ok(()),
+        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn init_wayland_protocols(
