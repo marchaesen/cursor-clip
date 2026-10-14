@@ -40,3 +40,9 @@ aes-gcm = "0.11.1"
 sha2 = "0.11.1"
 rand = "0.10.4"
 rustix = { version = "1", features = ["fs"] }
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
