@@ -129,8 +129,9 @@ pub enum BackendMessage {
 }
 
 impl ClipboardContentType {
+    /// Guess the type of plain text. Passwords are not guessed: only entries
+    /// carrying the password manager hint are treated as passwords.
     pub fn type_from_preview(content: &str) -> Self {
-        const PASSWORD_SPECIALS: &str = "!@#$%^&*()-_=+[]{};:,.<>?/\\|`~";
         if content.starts_with("http://") || content.starts_with("https://") {
             Self::Url
         } else if content.contains("fn ")
@@ -140,12 +141,6 @@ impl ClipboardContentType {
             Self::Code
         } else if content.contains('/') && !content.contains(' ') && content.len() < 256 {
             Self::File
-        } else if !content.is_empty()
-            && content.len() < 50
-            && !content.contains(' ')
-            && content.chars().any(|c| PASSWORD_SPECIALS.contains(c))
-        {
-            Self::Password
         } else {
             Self::Text
         }

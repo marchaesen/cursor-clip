@@ -43,7 +43,7 @@ Features a Windows 11–style clipboard history interface with native GNOME desi
   - 📝 Text
   - 🔗 URLs
   - 💻 Code
-  - 🔒 Passwords
+  - 🔒 Passwords (only when the password manager marks them, e.g. KeePassXC)
   - 📁 File paths
   - 🖼️ Images
 

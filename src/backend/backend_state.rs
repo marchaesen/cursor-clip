@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_keeps_newer_selection_and_unmarked_passwords() {
+    fn expiry_keeps_newer_selection_and_unhinted_entries() {
         let mut state = test_state(false);
         state
             .add_clipboard_item_from_mime_map(password_mimes("secret"))
@@ -972,10 +972,7 @@ mod tests {
         state.expire_password_items(220);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].item_id, newer_id);
-        assert_eq!(
-            state.history[0].content_type,
-            ClipboardContentType::Password
-        );
+        assert_eq!(state.history[0].content_type, ClipboardContentType::Text);
         assert!(state.history[0].expires_at().is_none());
         assert_eq!(state.current_source_entry_id, Some(newer_id));
         assert!(state.suppress_next_selection_read);
