@@ -42,3 +42,9 @@ aes-gcm = "0.11.1"
 base64 = "0.23.1"
 sha2 = "0.11.0"
 rand = "0.10.3"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
