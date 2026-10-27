@@ -1379,7 +1379,7 @@ fn pointer_in_card(widget: &Box, card: &Overlay, x: f64, y: f64) -> Option<(f64,
 }
 
 /// Build the key controller: Esc hides and clears search or closes, arrows/Enter
-/// navigate and activate, Delete removes and Ctrl+P pins the selected item.
+/// navigate and activate, Delete or Ctrl+X removes and Ctrl+P pins the selected item.
 /// Any other typing goes to the search field, wherever the focus is.
 fn generate_key_controller(
     list_box: &gtk4::ListBox,
@@ -1492,6 +1492,10 @@ fn generate_key_controller(
                 delete_selected_item(&list_box_for_keys, &history_state_for_keys);
                 gtk4::glib::Propagation::Stop
             }
+            Key::x | Key::X if focus_on_row && state.contains(ModifierType::CONTROL_MASK) => {
+                delete_selected_item(&list_box_for_keys, &history_state_for_keys);
+                gtk4::glib::Propagation::Stop
+            }
             Key::p | Key::P if focus_on_row && state.contains(ModifierType::CONTROL_MASK) => {
                 toggle_pin_selected_item(&list_box_for_keys, &history_state_for_keys);
                 gtk4::glib::Propagation::Stop
@@ -1559,9 +1563,25 @@ fn selected_item_id(list_box: &gtk4::ListBox) -> Option<u64> {
 }
 
 fn delete_selected_item(list_box: &gtk4::ListBox, history_state: &HistoryListState) {
-    let Some(item_id) = selected_item_id(list_box) else {
-        return;
-    };
+    if let Some(item_id) = selected_item_id(list_box) {
+        delete_item(list_box, history_state, item_id);
+    }
+}
+
+/// The shown row after the item's row, or before it when it is the last one.
+fn neighbour_item_id(list_box: &gtk4::ListBox, item_id: u64) -> Option<u64> {
+    let index = list_rows(list_box)
+        .into_iter()
+        .find(|row| row_item_id(row) == Some(item_id))?
+        .index();
+    shown_row_from(list_box, index, 1)
+        .or_else(|| shown_row_from(list_box, index, -1))
+        .and_then(|row| row_item_id(&row))
+}
+
+/// Delete an item and move the selection to the row that took its place.
+fn delete_item(list_box: &gtk4::ListBox, history_state: &HistoryListState, item_id: u64) {
+    let neighbour_id = neighbour_item_id(list_box, item_id);
 
     match FrontendClient::new() {
         Ok(mut client) => {
@@ -1584,7 +1604,10 @@ fn delete_selected_item(list_box: &gtk4::ListBox, history_state: &HistoryListSta
     }
 
     rebuild_list(list_box, history_state);
-    select_first_row(list_box);
+    match neighbour_id {
+        Some(id) => select_row_by_item_id(list_box, history_state, id),
+        None => select_first_row(list_box),
+    }
 }
 
 fn toggle_pin_selected_item(list_box: &gtk4::ListBox, history_state: &HistoryListState) {
@@ -2151,28 +2174,7 @@ fn generate_listboxrow_from_preview(
     let list_box_for_delete = list_box.clone();
     let history_state_for_delete = history_state.clone();
     delete_button.connect_clicked(move |_| {
-        match FrontendClient::new() {
-            Ok(mut client) => {
-                if let Err(e) = client.delete_item_by_id(item_id) {
-                    error!("Error deleting clipboard item by ID: {}", e);
-                    return;
-                }
-            }
-            Err(e) => {
-                error!("Error creating frontend client: {}", e);
-                return;
-            }
-        }
-
-        {
-            let mut items = history_state_for_delete.all_items.borrow_mut();
-            if let Some(index) = items.iter().position(|entry| entry.item_id == item_id) {
-                items.remove(index);
-            }
-        }
-
-        rebuild_list(&list_box_for_delete, &history_state_for_delete);
-        select_first_row(&list_box_for_delete);
+        delete_item(&list_box_for_delete, &history_state_for_delete, item_id);
     });
     let list_box_for_pin = list_box.clone();
     let history_state_for_pin = history_state.clone();
