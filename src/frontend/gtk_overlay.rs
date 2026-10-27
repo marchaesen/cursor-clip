@@ -1762,7 +1762,7 @@ fn point_in(
 }
 
 /// Build the key controller: Esc hides and clears search or closes, arrows/Enter
-/// navigate and activate, Delete removes and Ctrl+P pins the selected item.
+/// navigate and activate, Delete or Ctrl+X removes and Ctrl+P pins the selected item.
 /// Any other typing goes to the search field, wherever the focus is.
 fn generate_key_controller(
     list_box: &gtk4::ListBox,
@@ -1884,6 +1884,12 @@ fn generate_key_controller(
                 }
                 gtk4::glib::Propagation::Stop
             }
+            Key::x | Key::X if focus_on_row && state.contains(ModifierType::CONTROL_MASK) => {
+                if let Some(id) = selected_item_id(&list_box_for_keys) {
+                    delete_item(&list_box_for_keys, &history_state_for_keys, id);
+                }
+                gtk4::glib::Propagation::Stop
+            }
             Key::p | Key::P if focus_on_row && state.contains(ModifierType::CONTROL_MASK) => {
                 if let Some(id) = selected_item_id(&list_box_for_keys) {
                     toggle_item_pin(&list_box_for_keys, &history_state_for_keys, id);
@@ -1952,10 +1958,23 @@ fn selected_item_id(list_box: &gtk4::ListBox) -> Option<u64> {
     row_item_id(&list_box.selected_row()?)
 }
 
+/// The shown row after the item's row, or before it when it is the last one.
+fn neighbour_item_id(list_box: &gtk4::ListBox, item_id: u64) -> Option<u64> {
+    let index = list_rows(list_box)
+        .into_iter()
+        .find(|row| row_item_id(row) == Some(item_id))?
+        .index();
+    shown_row_from(list_box, index, 1)
+        .or_else(|| shown_row_from(list_box, index, -1))
+        .and_then(|row| row_item_id(&row))
+}
+
+/// Delete an item and move the selection to the row that took its place.
 fn delete_item(list_box: &gtk4::ListBox, history_state: &HistoryListState, item_id: u64) {
     if !history_state.can_act_on_rows() {
         return;
     }
+    let neighbour_id = neighbour_item_id(list_box, item_id);
 
     if let Err(error) =
         FrontendClient::new().and_then(|mut client| client.delete_item_by_id(item_id))
@@ -1969,7 +1988,10 @@ fn delete_item(list_box: &gtk4::ListBox, history_state: &HistoryListState, item_
         .retain(|item| item.item_id != item_id);
 
     rebuild_list(list_box, history_state);
-    select_first_row(list_box);
+    match neighbour_id {
+        Some(id) => select_row_by_item_id(list_box, id),
+        None => select_first_row(list_box),
+    }
 }
 
 fn toggle_item_pin(list_box: &gtk4::ListBox, history_state: &HistoryListState, item_id: u64) {
