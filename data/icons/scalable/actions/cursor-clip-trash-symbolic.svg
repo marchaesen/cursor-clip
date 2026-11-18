@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Wastebin: lid with a handle on top, a tapered body and two vertical slats.
+  Bundled so the delete buttons read as a bin on every desktop, instead of
+  whatever "user-trash-symbolic" happens to resolve to in the installed icon
+  theme (COSMIC inherits Pop, GNOME uses Adwaita, KDE ships Breeze).
+
+  Drawn for cursor-clip. Filled shapes only, so GTK's symbolic recolouring
+  applies the foreground colour without any stroke handling.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path class="foreground-fill" fill="rgb(0,0,0)" d="M6 1h4v2H9V2H7v1H6z"/>
+  <rect class="foreground-fill" fill="rgb(0,0,0)" x="2" y="3" width="12" height="2" rx="1"/>
+  <path class="foreground-fill" fill="rgb(0,0,0)" fill-rule="evenodd" d="M3 6h10l-.8 7.7a1.3 1.3 0 0 1-1.3 1.3H5.1a1.3 1.3 0 0 1-1.3-1.3zM6 8v5h1V8zm3 0v5h1V8z"/>
+</svg>

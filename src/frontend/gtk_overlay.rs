@@ -37,6 +37,8 @@ const RESIZE_CORNER_SIZE: i32 = 14;
 /// desktop rather than depending on whichever icon theme is installed.
 const BUNDLED_ICON_RESOURCE_PATH: &str = "/io/github/sirulex/cursor-clip/icons";
 const PIN_ICON: &str = "cursor-clip-pin-symbolic";
+/// The wastebin used by the per-row delete button and the "Clear All" button.
+const TRASH_ICON: &str = "cursor-clip-trash-symbolic";
 const PIN_ICON_PIXEL_SIZE: i32 = 16;
 /// A red bar drawn diagonally across the pin marks an unpinned row.
 const PIN_SLASH_LENGTH: i32 = 16;
@@ -1102,7 +1104,7 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         request_quit();
     });
 
-    let clear_button = Button::builder().icon_name("user-trash-symbolic").build();
+    let clear_button = Button::builder().icon_name(TRASH_ICON).build();
     clear_button.add_css_class("flat");
     clear_button.add_css_class("compact-header-action");
     clear_button.set_tooltip_text(Some("Clear entire clipboard history"));
@@ -2435,8 +2437,10 @@ fn register_bundled_icons() {
 
     // Without this the only symptom would be a broken-image placeholder on
     // every row, which is easy to miss and hard to trace back.
-    if !icon_theme.has_icon(PIN_ICON) {
-        warn!("Bundled icon {PIN_ICON} did not resolve after registering its resource path");
+    for icon in [PIN_ICON, TRASH_ICON] {
+        if !icon_theme.has_icon(icon) {
+            warn!("Bundled icon {icon} did not resolve after registering its resource path");
+        }
     }
 }
 
@@ -2517,7 +2521,7 @@ fn generate_listboxrow_from_preview(
     }
     pin_button.set_visible(show_pin);
 
-    let delete_button = Button::builder().icon_name("user-trash-symbolic").build();
+    let delete_button = Button::builder().icon_name(TRASH_ICON).build();
     delete_button.add_css_class("flat");
     delete_button.add_css_class("destructive-action");
     delete_button.add_css_class("clipboard-delete");

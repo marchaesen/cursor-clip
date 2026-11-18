@@ -2,5 +2,6 @@
 <gresources>
   <gresource prefix="/io/github/sirulex/cursor-clip/icons">
     <file>scalable/actions/cursor-clip-pin-symbolic.svg</file>
+    <file>scalable/actions/cursor-clip-trash-symbolic.svg</file>
   </gresource>
 </gresources>
