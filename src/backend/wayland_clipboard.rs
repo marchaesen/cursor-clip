@@ -2,6 +2,7 @@ use super::selection::SelectionOwner;
 use crate::backend::backend_state::BackendState;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -252,13 +253,7 @@ fn write_with_stall_timeout(fd: std::os::fd::OwnedFd, data: &[u8]) -> Result<(),
     use std::os::fd::AsRawFd;
 
     let raw_fd = fd.as_raw_fd();
-    // SAFETY: raw_fd is a valid open descriptor owned by `fd` for this scope.
-    unsafe {
-        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
+    set_nonblocking(raw_fd);
 
     let mut file: std::fs::File = fd.into();
     let mut remaining = data;
@@ -498,6 +493,113 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for MutexBackendState
 
 // ================= Helper functions =================
 
+/// Put a descriptor in non-blocking mode so reads and writes can be bounded with `poll`.
+fn set_nonblocking(raw_fd: std::os::fd::RawFd) {
+    // SAFETY: the caller guarantees `raw_fd` is a valid open descriptor for this call.
+    unsafe {
+        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// X11 selection-protocol targets that XWayland forwards as if they were MIME types.
+/// They are protocol controls, not clipboard payloads: requesting `INCR` in
+/// particular never reaches EOF, which used to freeze the whole capture loop.
+const X11_META_TARGETS: &[&str] = &[
+    "MULTIPLE",
+    "DELETE",
+    "INCR",
+    "TARGETS",
+    "TIMESTAMP",
+    "SAVE_TARGETS",
+];
+
+/// Give up on a sender that stops writing for this long.
+const READ_STALL_TIMEOUT_MS: i32 = 2_000;
+/// Upper bound for reading every format of a single offer.
+const READ_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Refuse payloads larger than this instead of exhausting memory.
+const MAX_READ_BYTES: usize = 128 * 1024 * 1024;
+
+/// Select the MIME types to actually read from the available list.
+/// X11 meta targets are always dropped. When image types are present, keep only
+/// PNG image data and all non-image variants.
+fn select_target_mimes(available_mimes: &[String]) -> Vec<String> {
+    let payload_mimes = available_mimes
+        .iter()
+        .filter(|m| !X11_META_TARGETS.contains(&m.as_str()));
+
+    if available_mimes.iter().any(|m| m.starts_with("image/")) {
+        return payload_mimes
+            .filter(|m| m.as_str() == "image/png" || !m.starts_with("image/"))
+            .cloned()
+            .collect();
+    }
+
+    payload_mimes.cloned().collect()
+}
+
+/// Read a pipe to EOF without ever blocking indefinitely.
+///
+/// Fails when the sender stalls for `stall_ms`, when `deadline` passes, or when
+/// more than `max_bytes` arrive. A partial payload is never returned.
+fn read_pipe_bounded(
+    fd: std::os::fd::OwnedFd,
+    deadline: Instant,
+    stall_ms: i32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let raw_fd = fd.as_raw_fd();
+    set_nonblocking(raw_fd);
+
+    let mut file: std::fs::File = fd.into();
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => return Ok(data),
+            Ok(read) => {
+                if data.len() + read > max_bytes {
+                    return Err(format!("payload exceeds {max_bytes} bytes"));
+                }
+                data.extend_from_slice(&chunk[..read]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("timed out waiting for data".into());
+                }
+                let wait_ms = i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .clamp(1, stall_ms);
+                let mut poll_fd = libc::pollfd {
+                    fd: raw_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll_fd is a single initialized pollfd that outlives the call.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, wait_ms) };
+                if ready == 0 {
+                    return Err("sender stopped writing".into());
+                }
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error.to_string());
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// Trait abstracting over offer types that can receive data via a pipe fd.
 trait DataOfferReceive {
     fn receive_mime(&self, mime_type: String, fd: std::os::fd::BorrowedFd<'_>);
@@ -521,17 +623,19 @@ fn read_all_data_formats<O: DataOfferReceive>(
     mime_types: Vec<String>,
     conn: &Connection,
 ) -> IndexMap<String, Bytes> {
-    use std::io::Read;
     use std::os::fd::AsFd;
 
     let mut mime_map: IndexMap<String, Bytes> = IndexMap::new();
 
-    // Keep every non-image format, but only request PNG for images.
-    for mime in mime_types
-        .into_iter()
-        .filter(|mime| mime == "image/png" || !mime.starts_with("image/"))
-    {
-        let (mut reader, writer) = match std::io::pipe() {
+    if mime_types.is_empty() {
+        return mime_map;
+    }
+
+    // One budget for the whole offer so several slow formats cannot add up to a long freeze.
+    let deadline = Instant::now() + READ_TOTAL_TIMEOUT;
+
+    for mime in select_target_mimes(&mime_types) {
+        let (reader, writer) = match std::io::pipe() {
             Ok(pair) => pair,
             Err(err) => {
                 warn!("Could not open pipe to read data for {mime}: {err:?}");
@@ -545,13 +649,17 @@ fn read_all_data_formats<O: DataOfferReceive>(
         if let Err(e) = conn.flush() {
             warn!("Flush failed: {e}");
         }
-        let mut buf = Vec::new();
-        match reader.read_to_end(&mut buf) {
-            Ok(_) if !buf.is_empty() => {
+        match read_pipe_bounded(
+            reader.into(),
+            deadline,
+            READ_STALL_TIMEOUT_MS,
+            MAX_READ_BYTES,
+        ) {
+            Ok(buf) if !buf.is_empty() => {
                 mime_map.insert(mime, Bytes::from(buf));
             }
             Ok(_) => {}
-            Err(e) => warn!("Failed reading data for mime: {e}"),
+            Err(e) => warn!("Failed reading data for {mime}: {e}"),
         }
     }
 
@@ -561,6 +669,16 @@ fn read_all_data_formats<O: DataOfferReceive>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| (*m).to_string()).collect()
+    }
+
+    fn create_pipes() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+        let (reader, writer) = std::io::pipe()?;
+        Ok((reader.into(), writer.into()))
+    }
 
     #[test]
     fn matches_internal_mime_subtypes_and_bare_formats() {
@@ -583,5 +701,89 @@ mod tests {
         ] {
             assert!(!is_internal_mime_type(mime), "{mime}");
         }
+    }
+
+    #[test]
+    fn select_target_mimes_drops_x11_meta_targets() {
+        let offered = mimes(&[
+            "MULTIPLE",
+            "DELETE",
+            "INCR",
+            "TARGETS",
+            "TIMESTAMP",
+            "SAVE_TARGETS",
+            "text/plain",
+            "STRING",
+        ]);
+        assert_eq!(
+            select_target_mimes(&offered),
+            mimes(&["text/plain", "STRING"])
+        );
+    }
+
+    #[test]
+    fn select_target_mimes_keeps_png_and_drops_other_images() {
+        let offered = mimes(&["INCR", "image/jpeg", "image/png", "text/html"]);
+        assert_eq!(
+            select_target_mimes(&offered),
+            mimes(&["image/png", "text/html"])
+        );
+    }
+
+    #[test]
+    fn select_target_mimes_keeps_password_hint() {
+        let offered = mimes(&[PASSWORD_HINT_MIME, "text/plain"]);
+        assert_eq!(select_target_mimes(&offered), offered);
+    }
+
+    #[test]
+    fn read_pipe_bounded_returns_data_at_eof() {
+        let (reader, writer) = create_pipes().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        writer.write_all(b"hello").unwrap();
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let data = read_pipe_bounded(reader, deadline, 1_000, 1024).unwrap();
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn read_pipe_bounded_gives_up_on_a_sender_that_never_closes() {
+        let (reader, writer) = create_pipes().unwrap();
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        // `writer` stays open and silent, exactly like an INCR target.
+        let result = read_pipe_bounded(reader, deadline, 100, 1024);
+
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(writer);
+    }
+
+    #[test]
+    fn read_pipe_bounded_honours_the_overall_deadline() {
+        let (reader, writer) = create_pipes().unwrap();
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(150);
+        let result = read_pipe_bounded(reader, deadline, 5_000, 1024);
+
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(writer);
+    }
+
+    #[test]
+    fn read_pipe_bounded_rejects_oversized_payloads() {
+        let (reader, writer) = create_pipes().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        writer.write_all(b"0123456789").unwrap();
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = read_pipe_bounded(reader, deadline, 1_000, 5);
+        assert!(result.is_err());
     }
 }
