@@ -3308,7 +3308,8 @@ mod tests {
                 content_preview: "first".into(),
                 timestamp: 0,
                 pinned: false,
-                active: false,
+                // The list starts on the entry that is in the clipboard.
+                active: true,
                 expires_at: None,
                 thumbnail: None,
             }],
@@ -3502,11 +3503,14 @@ mod tests {
             let BackendMessage::History { mut items } = history() else {
                 unreachable!()
             };
+            // The newest copy is now the entry in the clipboard.
+            items[0].active = false;
             items.insert(
                 0,
                 ClipboardItemPreview {
                     item_id: 2,
                     content_preview: "newest".into(),
+                    active: true,
                     ..items[0].clone()
                 },
             );
