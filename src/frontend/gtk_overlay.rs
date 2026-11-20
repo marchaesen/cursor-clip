@@ -3104,174 +3104,178 @@ mod size_tests {
     #[test]
     #[ignore = "requires a GTK display"]
     fn oversized_list_fits_the_output_at_the_cursor_and_in_the_center() {
-        adw::init().unwrap();
-        let config = UserConfig {
-            width: 1100,
-            height: 900,
-            margin: 32,
-            ..UserConfig::default()
-        };
-        let placement = Rc::new(Cell::new(CardPlacement {
-            position: config.position,
-            margin: config.margin,
-            cursor: (798.0, 599.0),
-            offset: (0, 0),
-            pinned: None,
-        }));
-        let content = generate_overlay_content(config);
-        let window = adw::ApplicationWindow::builder().build();
-        apply_custom_styling(&window);
-        content.overlay.add_css_class("cursor-clip-card");
-        let root = create_backdrop(&content.overlay, placement.clone());
-        window.set_content(Some(&root));
-        content.list_size.apply(0, 0, placement.get());
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let config = UserConfig {
+                width: 1100,
+                height: 900,
+                margin: 32,
+                ..UserConfig::default()
+            };
+            let placement = Rc::new(Cell::new(CardPlacement {
+                position: config.position,
+                margin: config.margin,
+                cursor: (798.0, 599.0),
+                offset: (0, 0),
+                pinned: None,
+            }));
+            let content = generate_overlay_content(config);
+            let window = adw::ApplicationWindow::builder().build();
+            apply_custom_styling(&window);
+            content.overlay.add_css_class("cursor-clip-card");
+            let root = create_backdrop(&content.overlay, placement.clone());
+            window.set_content(Some(&root));
+            content.list_size.apply(0, 0, placement.get());
 
-        for (position, inset) in [(PopupPosition::Cursor, 32), (PopupPosition::Center, 0)] {
-            placement.set(CardPlacement {
-                position,
-                ..placement.get()
-            });
-            content.list_size.apply(800, 600, placement.get());
-            root.allocate(800, 600, -1, None);
-            let bounds = content.overlay.compute_bounds(&root).unwrap();
-            assert_eq!((bounds.x(), bounds.y()), (inset as f32, inset as f32));
-            assert_eq!(bounds.width(), (800 - 2 * inset) as f32);
-            assert_eq!(bounds.height(), (600 - 2 * inset) as f32);
-        }
+            for (position, inset) in [(PopupPosition::Cursor, 32), (PopupPosition::Center, 0)] {
+                placement.set(CardPlacement {
+                    position,
+                    ..placement.get()
+                });
+                content.list_size.apply(800, 600, placement.get());
+                root.allocate(800, 600, -1, None);
+                let bounds = content.overlay.compute_bounds(&root).unwrap();
+                assert_eq!((bounds.x(), bounds.y()), (inset as f32, inset as f32));
+                assert_eq!(bounds.width(), (800 - 2 * inset) as f32);
+                assert_eq!(bounds.height(), (600 - 2 * inset) as f32);
+            }
 
-        content.list_size.apply(1920, 1080, placement.get());
-        root.allocate(1920, 1080, -1, None);
-        assert_eq!(content.list_size.scrolled.width(), 1100);
-        assert_eq!(content.list_size.scrolled.height(), 900);
+            content.list_size.apply(1920, 1080, placement.get());
+            root.allocate(1920, 1080, -1, None);
+            assert_eq!(content.list_size.scrolled.width(), 1100);
+            assert_eq!(content.list_size.scrolled.height(), 900);
+        });
     }
 
     #[test]
     #[ignore = "requires a GTK display"]
     fn list_size_applies_both_dimensions() {
-        adw::init().unwrap();
-        let config = UserConfig::default();
-        let dir =
-            std::env::temp_dir().join(format!("cursor-clip-size-{:x}", rand::random::<u64>()));
-        fs::create_dir(&dir).unwrap();
-        let path = dir.join("config.toml");
-        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
-        let item = ClipboardItemPreview {
-            item_id: 1,
-            content_preview: "long".repeat(300),
-            content_type: ClipboardContentType::Text,
-            timestamp: 1,
-            pinned: false,
-            active: false,
-            thumbnail: None,
-            expires_at: None,
-        };
-        let window = adw::ApplicationWindow::builder()
-            .default_width(1000)
-            .default_height(550)
-            .build();
-        apply_custom_styling(&window);
-        let content = generate_overlay_content(config);
-        apply_history(&content.list_box, &content.history_state, vec![item]);
-        content.overlay.add_css_class("cursor-clip-card");
-        let placement = Rc::new(Cell::new(CardPlacement {
-            position: PopupPosition::BottomRight,
-            margin: 24,
-            cursor: (990.0, 540.0),
-            offset: (0, 0),
-            pinned: None,
-        }));
-        let root = create_backdrop(&content.overlay, placement.clone());
-        window.set_content(Some(&root));
-        let size = &content.list_size;
-        let minimum = size
-            .header
-            .measure(Orientation::Horizontal, -1)
-            .0
-            .max(OVERLAY_MIN_WIDTH);
-        let wait_for_size = |width, height| {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let config = UserConfig::default();
+            let dir =
+                std::env::temp_dir().join(format!("cursor-clip-size-{:x}", rand::random::<u64>()));
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("config.toml");
+            fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let item = ClipboardItemPreview {
+                item_id: 1,
+                content_preview: "long".repeat(300),
+                content_type: ClipboardContentType::Text,
+                timestamp: 1,
+                pinned: false,
+                active: false,
+                thumbnail: None,
+                expires_at: None,
+            };
+            let window = adw::ApplicationWindow::builder()
+                .default_width(1000)
+                .default_height(550)
+                .build();
+            apply_custom_styling(&window);
+            let content = generate_overlay_content(config);
+            apply_history(&content.list_box, &content.history_state, vec![item]);
+            content.overlay.add_css_class("cursor-clip-card");
+            let placement = Rc::new(Cell::new(CardPlacement {
+                position: PopupPosition::BottomRight,
+                margin: 24,
+                cursor: (990.0, 540.0),
+                offset: (0, 0),
+                pinned: None,
+            }));
+            let root = create_backdrop(&content.overlay, placement.clone());
+            window.set_content(Some(&root));
+            let size = &content.list_size;
+            let minimum = size
+                .header
+                .measure(Orientation::Horizontal, -1)
+                .0
+                .max(OVERLAY_MIN_WIDTH);
+            let wait_for_size = |width, height| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while (size.scrolled.width(), size.scrolled.height()) != (width, height) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "expected {width} × {height}, allocated {} × {}",
+                        size.scrolled.width(),
+                        size.scrolled.height()
+                    );
+                    gtk4::glib::MainContext::default().iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            };
+            size.apply(1000, 550, placement.get());
+            window.present();
+            wait_for_size(350, 400);
+            let closed_width = content.overlay.width();
+
+            content.persistence.spinner.set_visible(true);
+            content
+                .persistence
+                .status
+                .set_label("Updating history storage…");
+            content.persistence.status.set_visible(true);
+            content
+                .persistence
+                .history_status
+                .set_label("Could not refresh clipboard history. Reopen to retry.");
+            content.persistence.history_status.set_visible(true);
+            content.menu_revealer.set_visible(true);
+            content.menu_revealer.set_reveal_child(true);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while (size.scrolled.width(), size.scrolled.height()) != (width, height) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "expected {width} × {height}, allocated {} × {}",
-                    size.scrolled.width(),
-                    size.scrolled.height()
-                );
+            while !content.menu_revealer.is_child_revealed() {
+                assert!(std::time::Instant::now() < deadline);
                 gtk4::glib::MainContext::default().iteration(false);
-                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-        };
-        size.apply(1000, 550, placement.get());
-        window.present();
-        wait_for_size(350, 400);
-        let closed_width = content.overlay.width();
+            assert_eq!(
+                content.overlay.width(),
+                closed_width,
+                "opening settings widened the card"
+            );
+            assert_eq!(size.scrolled.width(), 350);
+            content.persistence.spinner.set_visible(false);
+            content.persistence.status.set_visible(false);
+            content.persistence.history_status.set_visible(false);
+            size.set_requested(600, 280);
+            size.apply(1000, 550, placement.get());
+            wait_for_size(600.max(minimum), 280);
+            let title = content
+                .title_handle
+                .first_child()
+                .unwrap()
+                .downcast::<Label>()
+                .unwrap();
+            assert!(
+                title.width()
+                    >= title
+                        .create_pango_layout(Some(&title.text()))
+                        .pixel_size()
+                        .0,
+                "header title was truncated on a wide card: {} pixels",
+                title.width()
+            );
+            let bounds = content.overlay.compute_bounds(&root).unwrap();
+            assert_eq!(bounds.x() + bounds.width(), (root.width() - 24) as f32);
+            assert_eq!(bounds.y() + bounds.height(), (root.height() - 24) as f32);
 
-        content.persistence.spinner.set_visible(true);
-        content
-            .persistence
-            .status
-            .set_label("Updating history storage…");
-        content.persistence.status.set_visible(true);
-        content
-            .persistence
-            .history_status
-            .set_label("Could not refresh clipboard history. Reopen to retry.");
-        content.persistence.history_status.set_visible(true);
-        content.menu_revealer.set_visible(true);
-        content.menu_revealer.set_reveal_child(true);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !content.menu_revealer.is_child_revealed() {
-            assert!(std::time::Instant::now() < deadline);
-            gtk4::glib::MainContext::default().iteration(false);
-        }
-        assert_eq!(
-            content.overlay.width(),
-            closed_width,
-            "opening settings widened the card"
-        );
-        assert_eq!(size.scrolled.width(), 350);
-        content.persistence.spinner.set_visible(false);
-        content.persistence.status.set_visible(false);
-        content.persistence.history_status.set_visible(false);
-        size.set_requested(600, 280);
-        size.apply(1000, 550, placement.get());
-        wait_for_size(600.max(minimum), 280);
-        let title = content
-            .title_handle
-            .first_child()
-            .unwrap()
-            .downcast::<Label>()
+            window.set_visible(false);
+            content.menu_revealer.set_visible(false);
+            content.search_entry.set_visible(true);
+            *content.history_state.search_query.borrow_mut() = "no matches".into();
+            apply_search_filter(&content.list_box, &content.history_state);
+            UserConfig::update(&path, |cfg| {
+                cfg.width = 1;
+                cfg.height = 190;
+            })
             .unwrap();
-        assert!(
-            title.width()
-                >= title
-                    .create_pango_layout(Some(&title.text()))
-                    .pixel_size()
-                    .0,
-            "header title was truncated on a wide card: {} pixels",
-            title.width()
-        );
-        let bounds = content.overlay.compute_bounds(&root).unwrap();
-        assert_eq!(bounds.x() + bounds.width(), (root.width() - 24) as f32);
-        assert_eq!(bounds.y() + bounds.height(), (root.height() - 24) as f32);
-
-        window.set_visible(false);
-        content.menu_revealer.set_visible(false);
-        content.search_entry.set_visible(true);
-        *content.history_state.search_query.borrow_mut() = "no matches".into();
-        apply_search_filter(&content.list_box, &content.history_state);
-        UserConfig::update(&path, |cfg| {
-            cfg.width = 1;
-            cfg.height = 190;
-        })
-        .unwrap();
-        let cfg = UserConfig::load_or_create(&path).unwrap();
-        size.set_requested(cfg.width, cfg.height);
-        size.apply(1000, 550, placement.get());
-        window.present();
-        wait_for_size(minimum, 190);
-        window.close();
-        fs::remove_dir_all(dir).unwrap();
+            let cfg = UserConfig::load_or_create(&path).unwrap();
+            size.set_requested(cfg.width, cfg.height);
+            size.apply(1000, 550, placement.get());
+            window.present();
+            wait_for_size(minimum, 190);
+            window.close();
+            fs::remove_dir_all(dir).unwrap();
+        });
     }
 }
 
