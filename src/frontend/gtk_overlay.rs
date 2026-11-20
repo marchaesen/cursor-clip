@@ -518,9 +518,6 @@ fn create_layer_shell_window(
         location.monitor_height,
         placement.get(),
     );
-    content
-        .list_size
-        .connect_apply(&config_path(), placement.clone());
     attach_resize_gestures(&backdrop, &card, &content, &placement, &config_path());
     attach_move_gesture(&backdrop, &card, &content, &placement);
     content.search_entry.connect_visible_notify({
@@ -700,25 +697,9 @@ fn find_gdk_monitor(connector: &str) -> Option<gtk4::gdk::Monitor> {
         .find(|monitor| monitor.connector().as_deref() == Some(connector))
 }
 
-fn dimension_entry(label: &str, value: i32) -> gtk4::Entry {
-    let entry = gtk4::Entry::builder()
-        .width_chars(4)
-        .max_width_chars(5)
-        .placeholder_text(label)
-        .input_purpose(gtk4::InputPurpose::Digits)
-        .text(value.to_string())
-        .build();
-    entry.set_tooltip_text(Some(label));
-    entry
-}
-
 struct ListSize {
     header: adw::HeaderBar,
     scrolled: gtk4::ScrolledWindow,
-    width_entry: gtk4::Entry,
-    height_entry: gtk4::Entry,
-    apply_button: Button,
-    error: Label,
     requested: Cell<(i32, i32)>,
     last_width: Cell<Option<i32>>,
 }
@@ -726,9 +707,6 @@ struct ListSize {
 impl ListSize {
     fn set_requested(&self, width: i32, height: i32) {
         self.requested.set((width, height));
-        self.width_entry.set_text(&width.to_string());
-        self.height_entry.set_text(&height.to_string());
-        self.error.set_visible(false);
     }
 
     fn header_minimum(&self) -> i32 {
@@ -771,52 +749,6 @@ impl ListSize {
         };
         self.scrolled
             .set_min_content_height(requested_height.clamp(1, max_height));
-    }
-
-    fn connect_apply(self: &Rc<Self>, path: &Path, placement: Rc<Cell<CardPlacement>>) {
-        for entry in [&self.width_entry, &self.height_entry] {
-            let button = self.apply_button.downgrade();
-            entry.connect_activate(move |_| {
-                if let Some(button) = button.upgrade() {
-                    button.emit_clicked();
-                }
-            });
-        }
-        let size = Rc::downgrade(self);
-        let path = path.to_owned();
-        self.apply_button.connect_clicked(move |_| {
-            let Some(size) = size.upgrade() else { return };
-            let positive =
-                |entry: &gtk4::Entry| entry.text().trim().parse::<i32>().ok().filter(|n| *n > 0);
-            let (Some(width), Some(height)) =
-                (positive(&size.width_entry), positive(&size.height_entry))
-            else {
-                size.error
-                    .set_label("Enter a positive whole number for each dimension.");
-                size.error.set_visible(true);
-                return;
-            };
-            if let Err(e) = UserConfig::update(&path, |cfg| {
-                cfg.width = width;
-                cfg.height = height;
-            }) {
-                eprintln!(
-                    "cursor-clip: could not save size to {}: {e}",
-                    path.display()
-                );
-                size.error
-                    .set_label("Could not save the size. Check config.toml.");
-                size.error.set_visible(true);
-                return;
-            }
-            size.set_requested(width, height);
-            let (area_width, area_height) = size
-                .scrolled
-                .root()
-                .and_then(|r| r.downcast::<gtk4::Window>().ok())
-                .map_or((0, 0), |window| (window.width(), window.height()));
-            size.apply(area_width, area_height, placement.get());
-        });
     }
 }
 
@@ -1062,22 +994,6 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         .sync_create()
         .build();
 
-    let size_row = Box::new(Orientation::Horizontal, 6);
-    let width_entry = dimension_entry("Width", config.width);
-    let height_entry = dimension_entry("Height", config.height);
-    let apply_button = Button::with_label("Apply");
-    size_row.append(&width_entry);
-    size_row.append(&Label::new(Some("×")));
-    size_row.append(&height_entry);
-    size_row.append(&apply_button);
-    menu_box.append(&size_row);
-    let size_error = Label::new(None);
-    size_error.add_css_class("error");
-    size_error.set_halign(Align::Start);
-    size_error.set_wrap(true);
-    size_error.set_max_width_chars(26);
-    size_error.set_visible(false);
-    menu_box.append(&size_error);
     let persistence_status = Label::new(None);
     persistence_status.set_halign(Align::Start);
     persistence_status.set_wrap(true);
@@ -1441,10 +1357,6 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         list_size: Rc::new(ListSize {
             header: header_bar,
             scrolled: scrolled_window,
-            width_entry,
-            height_entry,
-            apply_button,
-            error: size_error,
             requested: Cell::new((config.width, config.height)),
             last_width: Cell::new(None),
         }),
@@ -1623,8 +1535,7 @@ struct ResizeStart {
 /// The grips sit on the card, so they move as it grows. The backdrop covers the
 /// whole output and never moves, so the pointer is tracked in backdrop
 /// coordinates and the size is the start size plus the pointer travel since the
-/// drag began. The result is written through `ListSize`, the same path the
-/// width/height entries use.
+/// drag began. The result is applied through `ListSize` and saved on release.
 fn attach_resize_gestures(
     backdrop: &Overlay,
     card: &Overlay,
@@ -3232,7 +3143,7 @@ mod size_tests {
 
     #[test]
     #[ignore = "requires a GTK display"]
-    fn size_fields_apply_save_and_reload_both_dimensions() {
+    fn list_size_applies_both_dimensions() {
         adw::init().unwrap();
         let config = UserConfig::default();
         let dir =
@@ -3286,13 +3197,6 @@ mod size_tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
-        let keys = generate_key_controller(
-            &content.list_box,
-            &content.history_state,
-            &content.search_entry,
-        );
-        window.add_controller(keys.clone());
-        size.connect_apply(&path, placement.clone());
         size.apply(1000, 550, placement.get());
         window.present();
         wait_for_size(350, 400);
@@ -3309,9 +3213,6 @@ mod size_tests {
             .history_status
             .set_label("Could not refresh clipboard history. Reopen to retry.");
         content.persistence.history_status.set_visible(true);
-        size.height_entry.set_text("");
-        size.apply_button.emit_clicked();
-        assert!(size.error.get_visible());
         content.menu_revealer.set_visible(true);
         content.menu_revealer.set_reveal_child(true);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -3325,39 +3226,15 @@ mod size_tests {
             "opening settings widened the card"
         );
         assert_eq!(size.scrolled.width(), 350);
-        for widget in [
-            size.width_entry.upcast_ref::<gtk4::Widget>(),
-            size.height_entry.upcast_ref(),
-            size.apply_button.upcast_ref(),
-        ] {
-            let bounds = widget.compute_bounds(&content.overlay).unwrap();
-            assert!(
-                bounds.width() > 0.0
-                    && bounds.x() >= 0.0
-                    && bounds.x() + bounds.width() <= closed_width as f32,
-                "settings control outside the card: {bounds:?}"
-            );
-        }
         content.persistence.spinner.set_visible(false);
         content.persistence.status.set_visible(false);
         content.persistence.history_status.set_visible(false);
-        assert!(size.width_entry.grab_focus());
-        let consumed = keys.emit_by_name::<bool>(
-            "key-pressed",
-            &[
-                &gtk4::gdk::Key::_6,
-                &0u32,
-                &gtk4::gdk::ModifierType::empty(),
-            ],
-        );
-        assert!(!consumed && !content.search_entry.get_visible());
-        size.width_entry.set_text("600");
-        size.height_entry.set_text("280");
-        size.height_entry.emit_activate();
+        size.set_requested(600, 280);
+        size.apply(1000, 550, placement.get());
         wait_for_size(600.max(minimum), 280);
-        let title = size
-            .header
-            .title_widget()
+        let title = content
+            .title_handle
+            .first_child()
             .unwrap()
             .downcast::<Label>()
             .unwrap();
@@ -3373,13 +3250,6 @@ mod size_tests {
         let bounds = content.overlay.compute_bounds(&root).unwrap();
         assert_eq!(bounds.x() + bounds.width(), (root.width() - 24) as f32);
         assert_eq!(bounds.y() + bounds.height(), (root.height() - 24) as f32);
-        let saved = UserConfig::load_or_create(&path).unwrap();
-        assert_eq!((saved.width, saved.height), (600, 280));
-
-        size.height_entry.set_text("");
-        size.apply_button.emit_clicked();
-        assert!(size.error.get_visible());
-        assert_eq!(UserConfig::load_or_create(&path).unwrap().height, 280);
 
         window.set_visible(false);
         content.menu_revealer.set_visible(false);
@@ -3394,15 +3264,8 @@ mod size_tests {
         let cfg = UserConfig::load_or_create(&path).unwrap();
         size.set_requested(cfg.width, cfg.height);
         size.apply(1000, 550, placement.get());
-        assert_eq!(size.width_entry.text(), "1");
-        assert_eq!(size.height_entry.text(), "190");
         window.present();
         wait_for_size(minimum, 190);
-        fs::write(&path, "height = [").unwrap();
-        size.height_entry.set_text("300");
-        size.apply_button.emit_clicked();
-        assert!(size.error.get_visible());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "height = [");
         window.close();
         fs::remove_dir_all(dir).unwrap();
     }
