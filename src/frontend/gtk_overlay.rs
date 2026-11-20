@@ -43,9 +43,6 @@ const PIN_ICON_PIXEL_SIZE: i32 = 16;
 /// A red bar drawn diagonally across the pin marks an unpinned row.
 const PIN_SLASH_LENGTH: i32 = 16;
 const PIN_SLASH_THICKNESS: i32 = 2;
-/// Approximate header bar height, used to keep its buttons out of the resize strip.
-const HEADER_BAR_HEIGHT: i32 = 42;
-
 // Thread-local storage for the overlay state since GTK objects aren't Send/Sync
 thread_local! {
     static OVERLAY_WINDOW: RefCell<Option<adw::ApplicationWindow>> = const { RefCell::new(None) };
@@ -90,6 +87,8 @@ struct PersistenceControls {
 }
 
 struct OverlayContent {
+    clear_confirmation: Rc<ModalPanel>,
+    settings_menu: Rc<ModalPanel>,
     persistence: Rc<PersistenceControls>,
     overlay: Overlay,
     list_size: Rc<ListSize>,
@@ -97,8 +96,13 @@ struct OverlayContent {
     list_box: gtk4::ListBox,
     history_state: HistoryListState,
     search_entry: SearchEntry,
-    menu_revealer: Revealer,
     resize_handles: Vec<ResizeHandle>,
+}
+
+impl OverlayContent {
+    fn modal_panels(&self) -> Vec<Rc<ModalPanel>> {
+        vec![self.clear_confirmation.clone(), self.settings_menu.clone()]
+    }
 }
 
 /// A drag strip that resizes the card along the given axes.
@@ -110,13 +114,14 @@ struct ResizeHandle {
 
 /// The built overlay: window plus the parts that are reset on every show.
 struct OverlayUi {
+    clear_confirmation: Rc<ModalPanel>,
+    settings_menu: Rc<ModalPanel>,
     window: adw::ApplicationWindow,
     backdrop: Overlay,
     list_size: Rc<ListSize>,
     list_box: gtk4::ListBox,
     history_state: HistoryListState,
     search_entry: SearchEntry,
-    menu_revealer: Revealer,
     placement: Rc<Cell<CardPlacement>>,
 }
 
@@ -552,19 +557,17 @@ fn create_layer_shell_window(
     backdrop_click.set_button(0);
     backdrop_click.connect_pressed({
         let card_widget: gtk4::Widget = card.clone().upcast();
+        let panels = content.modal_panels();
         move |gesture, _, click_x, click_y| {
             let Some(widget) = gesture.widget() else {
                 return;
             };
-            // Let the modal dialog handle clicks, including its backdrop.
-            if widget
-                .downcast_ref::<adw::ApplicationWindow>()
-                .is_some_and(|window| window.visible_dialog().is_some())
-            {
+            let picked = widget.pick(click_x, click_y, gtk4::PickFlags::DEFAULT);
+            // An open panel is modal: it takes the click first.
+            if panels.iter().any(|panel| panel.take_click(picked.as_ref())) {
                 return;
             }
-            let inside_card = widget
-                .pick(click_x, click_y, gtk4::PickFlags::DEFAULT)
+            let inside_card = picked
                 .is_some_and(|picked| picked == card_widget || picked.is_ancestor(&card_widget));
             if !inside_card {
                 debug!("Click outside the overlay card - closing");
@@ -579,6 +582,7 @@ fn create_layer_shell_window(
         &content.list_box,
         &content.history_state,
         &content.search_entry,
+        &content.modal_panels(),
     );
     window.add_controller(key_controller);
 
@@ -599,13 +603,14 @@ fn create_layer_shell_window(
     });
 
     OverlayUi {
+        clear_confirmation: content.clear_confirmation,
+        settings_menu: content.settings_menu,
         window,
         backdrop,
         list_size: content.list_size,
         list_box: content.list_box,
         history_state: content.history_state,
         search_entry: content.search_entry,
-        menu_revealer: content.menu_revealer,
         placement,
     }
 }
@@ -627,9 +632,6 @@ fn toggle_resident_overlay() {
 fn hide_resident_overlay() {
     RESIDENT.with(|resident| {
         if let Some(resident) = resident.borrow().as_ref() {
-            if let Some(dialog) = resident.ui.window.visible_dialog() {
-                dialog.force_close();
-            }
             resident.ui.window.set_visible(false);
         }
     });
@@ -657,8 +659,8 @@ fn show_resident_overlay() {
         ui.history_state.search_query.borrow_mut().clear();
         ui.search_entry.set_text("");
         ui.search_entry.set_visible(false);
-        ui.menu_revealer.set_reveal_child(false);
-        ui.menu_revealer.set_visible(false);
+        ui.settings_menu.close();
+        ui.clear_confirmation.close();
         rebuild_list(&ui.list_box, &ui.history_state);
         refresh_time_labels(&ui.list_box, &ui.history_state);
         if let Some(scrolled) = ui
@@ -867,6 +869,188 @@ fn append_settings_toggle(menu: &Box, title: &str, active: bool) -> (Box, CheckB
     (row, check)
 }
 
+/// The height the theme gives the header bar: what it is allocated once laid
+/// out, otherwise what it asks for. Whatever sits under the header (a panel,
+/// the resize strip) starts there so the header's buttons stay clickable.
+fn header_height(header: &adw::HeaderBar) -> i32 {
+    match header.height() {
+        0 => header.measure(Orientation::Vertical, -1).1,
+        laid_out => laid_out,
+    }
+}
+
+/// How visible the rest of the card stays while a panel is open (1.0 = not
+/// dimmed). GTK's own disabled look fades single widgets only and leaves
+/// backgrounds such as the list rows untouched, so it is hardly noticeable.
+const BLOCKED_OPACITY: f64 = 0.4;
+
+/// A panel that opens over the card and takes it over, as a dialog would: the
+/// rest of the card is disabled and dimmed, and Esc or a click anywhere but on
+/// the panel dismisses it. The settings menu and the clear confirmation are
+/// both modal panels, so they behave alike.
+struct ModalPanel {
+    revealer: Revealer,
+    /// The panel opens right under it, whatever height the theme gives it.
+    header: adw::HeaderBar,
+    /// The rest of the card.
+    blocked: Vec<gtk4::Widget>,
+    /// Gets the keyboard focus back when the panel closes.
+    list_box: gtk4::ListBox,
+}
+
+impl ModalPanel {
+    fn new(
+        revealer: &Revealer,
+        header: &adw::HeaderBar,
+        blocked: Vec<gtk4::Widget>,
+        list_box: &gtk4::ListBox,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            revealer: revealer.clone(),
+            header: header.clone(),
+            blocked,
+            list_box: list_box.clone(),
+        })
+    }
+
+    /// The target state, not the animation state: `is_child_revealed()` stays
+    /// false until the transition finishes, so a second click during the
+    /// animation would re-open instead of closing.
+    fn is_open(&self) -> bool {
+        self.revealer.reveals_child()
+    }
+
+    fn open(&self) {
+        self.revealer.set_margin_top(header_height(&self.header));
+        for widget in &self.blocked {
+            widget.set_sensitive(false);
+            widget.set_opacity(BLOCKED_OPACITY);
+        }
+        self.revealer.set_visible(true);
+        self.revealer.set_reveal_child(true);
+    }
+
+    /// While the panel is open a click belongs to it: anywhere but on the panel
+    /// itself dismisses it, inside the card or outside it, as Esc does. Returns
+    /// whether the click was taken, so it must not also close the overlay.
+    fn take_click(&self, picked: Option<&gtk4::Widget>) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        let on_panel = picked.is_some_and(|widget| {
+            *widget == self.revealer.clone().upcast::<gtk4::Widget>()
+                || widget.is_ancestor(&self.revealer)
+        });
+        if !on_panel {
+            self.close();
+        }
+        true
+    }
+
+    fn close(&self) {
+        let had_focus = self.revealer.focus_child().is_some();
+        self.revealer.set_reveal_child(false);
+        self.revealer.set_visible(false);
+        // Enable the list again before handing it the focus.
+        for widget in &self.blocked {
+            widget.set_sensitive(true);
+            widget.set_opacity(1.0);
+        }
+        if had_focus && let Some(row) = self.list_box.selected_row() {
+            row.grab_focus();
+        }
+    }
+}
+
+/// The "clear history?" confirmation: a panel inside the card, under the clear
+/// button. A dialog would open centered on the window, and the window covers the
+/// whole output, so it would appear far from the button. A popover would sit
+/// next to the button, but it opens a surface of its own, and GTK 4.24 on
+/// Wayland then prints `gdk_frame_timings_presented() called on discarded frame`.
+fn build_clear_confirmation(
+    header: &adw::HeaderBar,
+    list_box: &gtk4::ListBox,
+    blocked: Vec<gtk4::Widget>,
+    on_confirm: impl Fn() + 'static,
+) -> Rc<ModalPanel> {
+    let title = Label::new(Some("Clear clipboard history?"));
+    title.add_css_class("heading");
+    title.set_halign(Align::Start);
+    title.set_xalign(0.0);
+    title.set_wrap(true);
+    title.set_max_width_chars(28);
+
+    let detail = Label::new(Some(
+        "All unpinned clipboard history items will be deleted. Pinned items are kept. \
+         This cannot be undone.",
+    ));
+    detail.add_css_class("dim-label");
+    detail.set_halign(Align::Start);
+    detail.set_xalign(0.0);
+    detail.set_wrap(true);
+    detail.set_max_width_chars(28);
+
+    let cancel = Button::with_label("Cancel");
+    cancel.set_widget_name("clear-cancel");
+    let confirm = Button::with_label("Clear");
+    confirm.set_widget_name("clear-confirm");
+    confirm.add_css_class("destructive-action");
+    let buttons = Box::new(Orientation::Horizontal, 6);
+    buttons.set_halign(Align::End);
+    buttons.set_margin_top(4);
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+
+    let content = Box::new(Orientation::Vertical, 6);
+    content.set_margin_top(4);
+    content.set_margin_bottom(4);
+    content.set_margin_start(5);
+    content.set_margin_end(5);
+    content.append(&title);
+    content.append(&detail);
+    content.append(&buttons);
+
+    // Same look and slide-in as the settings menu, anchored under the trash button.
+    let revealer = Revealer::new();
+    revealer.set_reveal_child(false);
+    revealer.set_visible(false);
+    revealer.set_transition_duration(120);
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    revealer.set_halign(Align::Start);
+    revealer.set_valign(Align::Start);
+    revealer.set_margin_start(5);
+    revealer.add_css_class("menu-revealer");
+    revealer.set_child(Some(&content));
+    // Cancel is focused when the panel opens, as the dialog's default was:
+    // Enter never clears by accident.
+    revealer.connect_map({
+        let cancel = cancel.clone();
+        move |_| {
+            cancel.grab_focus();
+        }
+    });
+
+    let panel = ModalPanel::new(&revealer, header, blocked, list_box);
+    cancel.connect_clicked({
+        let panel = Rc::downgrade(&panel);
+        move |_| {
+            if let Some(panel) = panel.upgrade() {
+                panel.close();
+            }
+        }
+    });
+    confirm.connect_clicked({
+        let panel = Rc::downgrade(&panel);
+        move |_| {
+            if let Some(panel) = panel.upgrade() {
+                panel.close();
+            }
+            on_confirm();
+        }
+    });
+    panel
+}
+
 fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     // Main container with standard libadwaita spacing
     let main_box = Box::new(Orientation::Vertical, 0);
@@ -943,7 +1127,6 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     menu_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     menu_revealer.set_halign(Align::End);
     menu_revealer.set_valign(Align::Start);
-    menu_revealer.set_margin_top(HEADER_BAR_HEIGHT);
     menu_revealer.set_margin_end(5);
     menu_revealer.add_css_class("menu-revealer");
 
@@ -1272,73 +1455,80 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     });
     search_entry.add_controller(search_key_controller);
 
-    let menu_revealer_toggle = menu_revealer.clone();
-    three_dot_menu.connect_clicked(move |_| {
-        // Target state, not animation state: is_child_revealed() stays false
-        // until the transition finishes, so a second click during the
-        // animation would re-open instead of closing.
-        let next_state = !menu_revealer_toggle.reveals_child();
-        menu_revealer_toggle.set_visible(next_state);
-        menu_revealer_toggle.set_reveal_child(next_state);
+    // The settings menu is a modal panel, like the clear confirmation.
+    let settings_menu = ModalPanel::new(
+        &menu_revealer,
+        &header_bar,
+        vec![main_box.clone().upcast()],
+        &list_box,
+    );
+    // Start on the first setting, so the keyboard works inside the menu.
+    menu_revealer.connect_map({
+        let first_setting = toggle_check.clone();
+        move |_| {
+            first_setting.grab_focus();
+        }
+    });
+    three_dot_menu.connect_clicked({
+        let settings_menu = settings_menu.clone();
+        move |_| {
+            if settings_menu.is_open() {
+                settings_menu.close();
+            } else {
+                settings_menu.open();
+            }
+        }
     });
 
     let history_for_clear = history_state.clone();
     let list_box_for_clear = list_box.clone();
     let controls_for_clear = persistence_controls.clone();
-    clear_button.connect_clicked(move |button| {
+    let blocked = vec![main_box.clone().upcast()];
+    let clear_confirmation = build_clear_confirmation(&header_bar, &list_box, blocked, move || {
         if !history_for_clear.can_act_on_rows() {
             return;
         }
-        let dialog = adw::AlertDialog::new(
-            Some("Clear clipboard history?"),
-            Some(
-                "All unpinned clipboard history items will be deleted. Pinned items are kept. \
-                 This cannot be undone.",
-            ),
-        );
-        dialog.add_response("cancel", "_Cancel");
-        dialog.add_response("clear", "_Clear");
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
-        let history_for_response = history_for_clear.clone();
-        let list_box_for_response = list_box_for_clear.clone();
-        let controls_for_response = controls_for_clear.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "clear" || !history_for_response.can_act_on_rows() {
+        let mut client = match FrontendClient::new() {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Error creating frontend client: {}", e);
                 return;
             }
-            let mut client = match FrontendClient::new() {
-                Ok(client) => client,
-                Err(e) => {
-                    error!("Error creating frontend client: {}", e);
-                    return;
-                }
-            };
+        };
 
-            if let Err(e) = client.clear_history() {
-                error!("Error clearing clipboard history: {}", e);
-                return;
-            }
+        if let Err(e) = client.clear_history() {
+            error!("Error clearing clipboard history: {}", e);
+            return;
+        }
 
-            // Pinned items survive a clear and the overlay stays open: show
-            // that right away, then reload what the backend really kept.
-            info!("Clipboard history cleared");
-            history_for_response
-                .all_items
-                .borrow_mut()
-                .retain(|item| item.pinned);
-            rebuild_list(&list_box_for_response, &history_for_response);
-            select_first_row(&list_box_for_response);
-            refresh_history(controls_for_response.clone());
-        });
-        dialog.present(Some(button));
+        // Pinned items survive a clear and the overlay stays open: show
+        // that right away, then reload what the backend really kept.
+        info!("Clipboard history cleared");
+        history_for_clear
+            .all_items
+            .borrow_mut()
+            .retain(|item| item.pinned);
+        rebuild_list(&list_box_for_clear, &history_for_clear);
+        select_first_row(&list_box_for_clear);
+        refresh_history(controls_for_clear.clone());
+    });
+    let history_for_click = history_state.clone();
+    let confirmation_for_click = clear_confirmation.clone();
+    clear_button.connect_clicked(move |_| {
+        if !history_for_click.can_act_on_rows() {
+            return;
+        }
+        if confirmation_for_click.is_open() {
+            confirmation_for_click.close();
+        } else {
+            confirmation_for_click.open();
+        }
     });
 
     let resize_right = build_resize_handle("e-resize", Align::End, Align::Fill);
     resize_right.set_size_request(RESIZE_HANDLE_THICKNESS, -1);
     // Start below the header bar so the close and menu buttons stay fully clickable.
-    resize_right.set_margin_top(HEADER_BAR_HEIGHT);
+    resize_right.set_margin_top(header_height(&header_bar));
 
     let resize_bottom = build_resize_handle("s-resize", Align::Fill, Align::End);
     resize_bottom.set_size_request(-1, RESIZE_HANDLE_THICKNESS);
@@ -1351,11 +1541,14 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
     overlay.set_child(Some(&main_box));
     overlay.add_overlay(&menu_revealer);
     overlay.set_measure_overlay(&menu_revealer, true);
+    overlay.add_overlay(&clear_confirmation.revealer);
     overlay.add_overlay(&resize_right);
     overlay.add_overlay(&resize_bottom);
     overlay.add_overlay(&resize_corner);
 
     OverlayContent {
+        clear_confirmation,
+        settings_menu,
         persistence: persistence_controls,
         overlay,
         list_size: Rc::new(ListSize {
@@ -1368,7 +1561,6 @@ fn generate_overlay_content(config: UserConfig) -> OverlayContent {
         list_box,
         history_state,
         search_entry,
-        menu_revealer,
         resize_handles: vec![
             ResizeHandle {
                 widget: resize_right,
@@ -1685,6 +1877,7 @@ fn generate_key_controller(
     list_box: &gtk4::ListBox,
     history_state: &HistoryListState,
     search_entry: &SearchEntry,
+    panels: &[Rc<ModalPanel>],
 ) -> gtk4::EventControllerKey {
     let controller = gtk4::EventControllerKey::new();
     // Run before the focused widget so Esc and type-to-search always work.
@@ -1692,15 +1885,17 @@ fn generate_key_controller(
     let list_box_for_keys = list_box.clone();
     let history_state_for_keys = history_state.clone();
     let search_entry_for_keys = search_entry.clone();
+    let panels_for_keys = panels.to_vec();
     controller.connect_key_pressed(move |controller, key, _, state| {
         use gtk4::gdk::{Key, ModifierType};
 
-        // Modal dialogs own keyboard input; don't search, activate or close history.
-        if controller
-            .widget()
-            .and_then(|widget| widget.downcast::<adw::ApplicationWindow>().ok())
-            .is_some_and(|window| window.visible_dialog().is_some())
-        {
+        // An open panel owns the keyboard: Esc closes it instead of the overlay,
+        // and no other key reaches search or the list.
+        if let Some(panel) = panels_for_keys.iter().find(|panel| panel.is_open()) {
+            if key == Key::Escape {
+                panel.close();
+                return gtk4::glib::Propagation::Stop;
+            }
             return gtk4::glib::Propagation::Proceed;
         }
 
@@ -2953,7 +3148,7 @@ mod size_tests {
             let path = config_path();
             UserConfig::update(&path, |cfg| cfg.type_instead_of_paste = true).unwrap();
             let content = generate_overlay_content(UserConfig::read(&path).unwrap());
-            let menu = content.menu_revealer.upcast_ref();
+            let menu = content.settings_menu.revealer.upcast_ref();
             let type_in = check_for(menu, "Type in").unwrap();
             let instant = check_for(menu, "Instant paste").unwrap();
             assert!(type_in.is_active());
@@ -3220,10 +3415,10 @@ mod size_tests {
                 .history_status
                 .set_label("Could not refresh clipboard history. Reopen to retry.");
             content.persistence.history_status.set_visible(true);
-            content.menu_revealer.set_visible(true);
-            content.menu_revealer.set_reveal_child(true);
+            content.settings_menu.revealer.set_visible(true);
+            content.settings_menu.revealer.set_reveal_child(true);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !content.menu_revealer.is_child_revealed() {
+            while !content.settings_menu.revealer.is_child_revealed() {
                 assert!(std::time::Instant::now() < deadline);
                 gtk4::glib::MainContext::default().iteration(false);
             }
@@ -3259,7 +3454,7 @@ mod size_tests {
             assert_eq!(bounds.y() + bounds.height(), (root.height() - 24) as f32);
 
             window.set_visible(false);
-            content.menu_revealer.set_visible(false);
+            content.settings_menu.revealer.set_visible(false);
             content.search_entry.set_visible(true);
             *content.history_state.search_query.borrow_mut() = "no matches".into();
             apply_search_filter(&content.list_box, &content.history_state);
@@ -3382,7 +3577,12 @@ mod tests {
             let state = &content.history_state;
             let window = adw::ApplicationWindow::builder().build();
             window.set_content(Some(&content.overlay));
-            let keys = generate_key_controller(list, state, &content.search_entry);
+            let keys = generate_key_controller(
+                list,
+                state,
+                &content.search_entry,
+                &content.modal_panels(),
+            );
             window.add_controller(keys.clone());
             window.present();
             let BackendMessage::History { mut items } = history() else {
@@ -3587,6 +3787,360 @@ mod tests {
             OVERLAY_WINDOW.with(|slot| slot.borrow_mut().take());
             drop(stalled);
             reset_close_flags();
+        });
+    }
+
+    fn find_named(root: &gtk4::Widget, name: &str) -> Option<gtk4::Widget> {
+        if root.widget_name() == name {
+            return Some(root.clone());
+        }
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find_named(&widget, name) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn clear_confirmation_only_clears_on_confirm() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let confirmed = Rc::new(Cell::new(0));
+            let rest_of_card = Box::new(Orientation::Vertical, 0);
+            let confirmation = build_clear_confirmation(
+                &adw::HeaderBar::new(),
+                &gtk4::ListBox::new(),
+                vec![rest_of_card.clone().upcast()],
+                {
+                    let confirmed = confirmed.clone();
+                    move || confirmed.set(confirmed.get() + 1)
+                },
+            );
+            let strip: gtk4::Widget = confirmation.revealer.clone().upcast();
+            let button = |name| {
+                find_named(&strip, name)
+                    .and_then(|widget| widget.downcast::<Button>().ok())
+                    .unwrap()
+            };
+
+            assert!(!confirmation.is_open(), "the strip starts closed");
+            assert!(rest_of_card.is_sensitive());
+            confirmation.open();
+            assert!(confirmation.is_open());
+            assert!(
+                !rest_of_card.is_sensitive(),
+                "the card must be disabled while the confirmation is open"
+            );
+            assert!(
+                rest_of_card.opacity() < 0.6,
+                "the card must be visibly dimmed while the confirmation is open"
+            );
+            button("clear-cancel").emit_clicked();
+            assert!(!confirmation.is_open());
+            assert!(
+                rest_of_card.is_sensitive() && rest_of_card.opacity() == 1.0,
+                "Cancel must give the card back, fully visible"
+            );
+            assert_eq!(confirmed.get(), 0, "Cancel must not clear anything");
+
+            confirmation.open();
+            button("clear-confirm").emit_clicked();
+            assert!(!confirmation.is_open());
+            assert!(rest_of_card.is_sensitive(), "Clear must re-enable the card");
+            assert_eq!(confirmed.get(), 1, "Clear must clear exactly once");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn escape_closes_an_open_panel_before_the_overlay() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let content = generate_overlay_content(UserConfig::default());
+            let keys = generate_key_controller(
+                &content.list_box,
+                &content.history_state,
+                &content.search_entry,
+                &content.modal_panels(),
+            );
+            let press = |key: gtk4::gdk::Key| {
+                keys.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[&key, &0u32, &gtk4::gdk::ModifierType::empty()],
+                )
+            };
+
+            for panel in content.modal_panels() {
+                panel.open();
+                assert!(
+                    !press(gtk4::gdk::Key::Return),
+                    "Enter must reach the focused widget, not the history list"
+                );
+                assert!(panel.is_open());
+                assert!(
+                    !content.list_box.is_sensitive(),
+                    "the history list must be disabled while a panel is open"
+                );
+                assert!(press(gtk4::gdk::Key::Escape), "Esc must be consumed");
+                assert!(!panel.is_open());
+                assert!(
+                    content.list_box.is_sensitive()
+                        && content.persistence.clear_button.is_sensitive(),
+                    "Esc must give the card back"
+                );
+                assert!(
+                    !is_close_requested(),
+                    "Esc closed the overlay instead of just the panel"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn resize_strip_starts_right_below_the_header() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .default_width(600)
+                .default_height(700)
+                .build();
+            // As in the overlay: the theme is loaded before the content is built.
+            apply_custom_styling(&window);
+            let content = generate_overlay_content(UserConfig::default());
+            window.set_content(Some(&content.overlay));
+            window.present();
+            let header = &content.list_size.header;
+            until(|| (header.height() > 0).then_some(()));
+
+            let strip = content
+                .resize_handles
+                .iter()
+                .find(|handle| handle.horizontal && !handle.vertical)
+                .expect("a horizontal-only strip on the right edge");
+            assert_eq!(
+                strip.widget.margin_top(),
+                header.height(),
+                "the strip must start where the header ends"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn clear_confirmation_opens_under_the_clear_button_inside_the_card() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let content = generate_overlay_content(UserConfig::default());
+            let window = adw::ApplicationWindow::builder()
+                .default_width(600)
+                .default_height(700)
+                .build();
+            apply_custom_styling(&window);
+            content.overlay.add_css_class("cursor-clip-card");
+            window.set_content(Some(&content.overlay));
+            content.list_size.apply(
+                0,
+                0,
+                CardPlacement {
+                    position: PopupPosition::Cursor,
+                    margin: 5,
+                    cursor: (0.0, 0.0),
+                    offset: (0, 0),
+                    pinned: None,
+                },
+            );
+            window.present();
+            let strip = &content.clear_confirmation.revealer;
+            let clear_button = &content.persistence.clear_button;
+            // The overlay is on screen before anyone can click the button.
+            until(|| (content.list_size.header.height() > 0).then_some(()));
+            content.clear_confirmation.open();
+            until(|| {
+                (strip.is_child_revealed()
+                    && strip.height() > 0
+                    && clear_button.width() > 0
+                    && content.overlay.width() > 0)
+                    .then_some(())
+            });
+
+            let button = clear_button.compute_bounds(&content.overlay).unwrap();
+            let strip_bounds = strip.compute_bounds(&content.overlay).unwrap();
+            let gap = strip_bounds.y() - (button.y() + button.height());
+            assert!(
+                strip_bounds.x() < button.x() + button.width()
+                    && strip_bounds.x() + strip_bounds.width() > button.x(),
+                "the strip must line up with the clear button: {strip_bounds:?} vs {button:?}"
+            );
+            assert!(
+                (0.0..24.0).contains(&gap),
+                "the strip must sit right below the clear button, gap {gap}: \
+                 header {}px, button {button:?}, strip {strip_bounds:?}",
+                content.list_size.header.height()
+            );
+            assert!(
+                strip_bounds.x() >= 0.0
+                    && strip_bounds.x() + strip_bounds.width() <= content.overlay.width() as f32,
+                "the strip must stay inside the card: {strip_bounds:?}"
+            );
+            let cancel = find_named(strip.upcast_ref(), "clear-cancel").unwrap();
+            assert!(cancel.is_focus(), "Cancel must be focused when it opens");
+            assert!(
+                !content.list_box.is_sensitive()
+                    && !content.search_entry.is_sensitive()
+                    && !clear_button.is_sensitive(),
+                "the rest of the card must be blocked while the confirmation is open"
+            );
+            assert!(
+                cancel.is_sensitive(),
+                "the confirmation itself must stay usable"
+            );
+
+            // A real pick over the dimmed list, as the click handler does:
+            // GTK skips disabled widgets, and the click must still dismiss the strip.
+            let list_area = content
+                .list_size
+                .scrolled
+                .compute_bounds(&window)
+                .unwrap()
+                .center();
+            let picked = window.pick(
+                f64::from(list_area.x()),
+                f64::from(list_area.y()),
+                gtk4::PickFlags::DEFAULT,
+            );
+            assert!(
+                picked.is_some(),
+                "a click on the dimmed list must hit something"
+            );
+            assert!(
+                content.clear_confirmation.take_click(picked.as_ref()),
+                "the click on the dimmed list must be taken by the confirmation"
+            );
+            assert!(
+                !content.clear_confirmation.is_open(),
+                "a click on the dimmed list must dismiss it, picked {picked:?}"
+            );
+            assert!(content.list_box.is_sensitive(), "and give the card back");
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn a_click_away_from_an_open_panel_dismisses_it() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let content = generate_overlay_content(UserConfig::default());
+            let list: gtk4::Widget = content.list_box.clone().upcast();
+            let header: gtk4::Widget = content.title_handle.clone().upcast();
+
+            for panel in content.modal_panels() {
+                let on_panel: gtk4::Widget = panel.revealer.clone().upcast();
+                // Closed: the click is not the panel's, so the overlay handles it.
+                assert!(!panel.take_click(Some(&list)));
+                assert!(!panel.take_click(None));
+
+                // Open: a click on the dimmed card, inside it, dismisses the panel...
+                for away in [Some(&list), Some(&header), None] {
+                    panel.open();
+                    assert!(panel.take_click(away), "the click must be taken");
+                    assert!(!panel.is_open(), "{away:?} must dismiss the panel");
+                }
+
+                // ...but a click on the panel itself leaves it open for its widgets.
+                panel.open();
+                assert!(panel.take_click(Some(&on_panel)));
+                assert!(panel.is_open(), "clicks on the panel must not dismiss it");
+                panel.close();
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn settings_menu_is_modal_and_opens_below_the_header() {
+        crate::test_support::isolated_test(|| {
+            adw::init().unwrap();
+            let content = generate_overlay_content(UserConfig::default());
+            let window = adw::ApplicationWindow::builder()
+                .default_width(600)
+                .default_height(700)
+                .build();
+            apply_custom_styling(&window);
+            content.overlay.add_css_class("cursor-clip-card");
+            window.set_content(Some(&content.overlay));
+            content.list_size.apply(
+                0,
+                0,
+                CardPlacement {
+                    position: PopupPosition::Cursor,
+                    margin: 5,
+                    cursor: (0.0, 0.0),
+                    offset: (0, 0),
+                    pinned: None,
+                },
+            );
+            window.present();
+            let header = &content.list_size.header;
+            until(|| (header.height() > 0).then_some(()));
+
+            let menu = &content.settings_menu;
+            menu.open();
+            let revealer = &menu.revealer;
+            until(|| {
+                (revealer.is_child_revealed()
+                    && revealer.height() > 0
+                    && content.overlay.width() > 0)
+                    .then_some(())
+            });
+            let header_bounds = header.compute_bounds(&content.overlay).unwrap();
+            let menu_bounds = revealer.compute_bounds(&content.overlay).unwrap();
+            assert!(
+                menu_bounds.y() >= header_bounds.y() + header_bounds.height(),
+                "the menu must open below the header: {menu_bounds:?} vs {header_bounds:?}"
+            );
+            assert!(
+                menu_bounds.x() >= 0.0
+                    && menu_bounds.x() + menu_bounds.width() <= content.overlay.width() as f32,
+                "the menu must stay inside the card: {menu_bounds:?}"
+            );
+            assert!(
+                !content.list_box.is_sensitive()
+                    && !content.search_entry.is_sensitive()
+                    && !content.persistence.clear_button.is_sensitive(),
+                "the rest of the card must be blocked while the menu is open"
+            );
+            assert!(
+                content.overlay.child().unwrap().opacity() < 0.6,
+                "and dimmed"
+            );
+            assert!(
+                revealer.is_sensitive(),
+                "the menu's own settings must stay usable"
+            );
+
+            // A click on the dimmed list dismisses it and gives the card back.
+            let list_area = content
+                .list_size
+                .scrolled
+                .compute_bounds(&window)
+                .unwrap()
+                .center();
+            let picked = window.pick(
+                f64::from(list_area.x()),
+                f64::from(list_area.y()),
+                gtk4::PickFlags::DEFAULT,
+            );
+            assert!(menu.take_click(picked.as_ref()));
+            assert!(!menu.is_open());
+            assert!(content.list_box.is_sensitive());
+            assert_eq!(content.overlay.child().unwrap().opacity(), 1.0);
+            window.close();
         });
     }
 }
