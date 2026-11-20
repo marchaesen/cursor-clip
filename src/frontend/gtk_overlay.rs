@@ -834,14 +834,18 @@ fn create_backdrop(card: &Overlay, placement: Rc<Cell<CardPlacement>>) -> Overla
     backdrop.add_overlay(card);
     backdrop.connect_get_child_position(move |backdrop, card| {
         let placement = placement.get();
-        let fit = |orientation, for_size, extent| {
-            let (minimum, natural, _, _) = card.measure(orientation, for_size);
-            natural
-                .min(placement.available(extent).max(minimum))
-                .min(extent)
-        };
-        let width = fit(Orientation::Horizontal, -1, backdrop.width());
-        let height = fit(Orientation::Vertical, width, backdrop.height());
+        // The list's minimum content width sets the card's width, and `ListSize`
+        // already keeps that within the output. The header's natural width
+        // (title plus buttons) is larger and would stop the card from shrinking
+        // to a narrow list.
+        let width = card
+            .measure(Orientation::Horizontal, -1)
+            .0
+            .min(backdrop.width());
+        let (minimum_height, natural_height, _, _) = card.measure(Orientation::Vertical, width);
+        let height = natural_height
+            .min(placement.available(backdrop.height()).max(minimum_height))
+            .min(backdrop.height());
         let (left, top) = placement.origin(backdrop.width() - width, backdrop.height() - height);
         Some(gtk4::gdk::Rectangle::new(left, top, width, height))
     });
